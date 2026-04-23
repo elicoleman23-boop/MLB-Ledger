@@ -217,6 +217,32 @@ def main():
                 f"lgxBA={b['league_xba']:.3f}"
             )
 
+        # Per-pitch HR contribution (Fix C):
+        #   contribution = share × blended_hr_per_contact
+        # Sum across pitches × weighted contact rate ≈ starter p_hr per PA.
+        print("\nPer-pitch HR/contact (batter | pitcher | blended vs league):")
+        share_sum_hr = sum(b["share"] for b in mp.starter_breakdown)
+        total_weighted_hr_per_contact = 0.0
+        for b in mp.starter_breakdown:
+            contribution = b["share"] * b["blended_hr_per_contact"]
+            total_weighted_hr_per_contact += contribution
+            print(
+                f"  {b['pitch_type']:3s} share={b['share'] * 100:4.1f}%  "
+                f"batter={b['batter_hr_per_contact']:.4f}  "
+                f"pitcher={b['pitcher_hr_per_contact']:.4f}  "
+                f"blended={b['blended_hr_per_contact']:.4f}  "
+                f"lg={b['league_hr_per_contact']:.4f}  "
+                f"→ share·blended={contribution:.4f}"
+            )
+        if share_sum_hr > 0:
+            wghr_per_contact = total_weighted_hr_per_contact / share_sum_hr
+            # mp.pa_probs[0].p_hr is post-park, so show raw pre-park too.
+            print(
+                f"  weighted HR/contact={wghr_per_contact:.4f} · "
+                f"× weighted contact → p_hr per PA (pre-park) ≈ "
+                f"{wghr_per_contact * sum(b['share'] * b['blended_contact'] for b in mp.starter_breakdown) / share_sum_hr:.4f}"
+            )
+
         print(f"\nPer-PA probabilities:")
         for i, pa in enumerate(mp.pa_probs, 1):
             print(f"  PA {i}: {pa.source:18s} P(hit)={pa.p_hit:.3f}  "

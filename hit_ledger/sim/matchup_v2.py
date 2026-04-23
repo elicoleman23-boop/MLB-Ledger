@@ -21,8 +21,10 @@ from hit_ledger.config import (
     HIT_TYPE_DIST,
     LEAGUE_AVG_CONTACT_RATE,
     LEAGUE_AVG_HR_PER_BBE,
+    LEAGUE_AVG_HR_PER_CONTACT,
     LEAGUE_AVG_K_RATE,
     LEAGUE_AVG_XBA,
+    LEAGUE_HR_PER_CONTACT_BY_PITCH,
     LEAGUE_WHIFF_BY_PITCH,
     LEAGUE_XBA_BY_PITCH,
     MIN_PITCHES_PER_SPLIT,
@@ -246,6 +248,65 @@ def _pitcher_rates_for_pitch(
     return xba_on_contact, contact_rate, n
 
 
+_NON_CONTACT_EVENTS = {
+    "strikeout", "strikeout_double_play",
+    "walk", "hit_by_pitch", "intent_walk",
+}
+
+
+def _batter_hr_per_contact_for_pitch(
+    batter_df: pd.DataFrame,
+    pitch_type: str,
+    p_throws: str,
+) -> tuple[float, int]:
+    """
+    Returns (hr_per_contact, n_contact_events) for this batter's contact
+    against this pitch type from the given pitcher handedness.
+
+    Contact events = PA-ending rows whose event is not a K, walk, HBP, or
+    intentional walk. hr_per_contact = HR / contact_events.
+    When there are no contact events, returns (0.0, 0) — the caller regresses
+    toward a league prior which handles the empty case.
+    """
+    if batter_df.empty:
+        return 0.0, 0
+    mask = (batter_df["pitch_type"] == pitch_type) & (batter_df["p_throws"] == p_throws)
+    rows = batter_df[mask]
+    pa_ending = rows[rows["events"].notna() & (rows["events"] != "")]
+    if pa_ending.empty:
+        return 0.0, 0
+    contact = pa_ending[~pa_ending["events"].isin(_NON_CONTACT_EVENTS)]
+    n_contact = len(contact)
+    if n_contact == 0:
+        return 0.0, 0
+    n_hr = int((contact["events"] == "home_run").sum())
+    return n_hr / n_contact, n_contact
+
+
+def _pitcher_hr_per_contact_for_pitch(
+    pitcher_df: pd.DataFrame,
+    pitch_type: str,
+    batter_stands: str,
+) -> tuple[float, int]:
+    """HR allowed per contact event for this pitcher's pitch_type vs
+    batters of `batter_stands` handedness. Mirrors the batter helper."""
+    if pitcher_df is None or pitcher_df.empty:
+        return 0.0, 0
+    mask = pitcher_df["pitch_type"] == pitch_type
+    if batter_stands in ("L", "R") and "stand" in pitcher_df.columns:
+        mask &= pitcher_df["stand"] == batter_stands
+    rows = pitcher_df[mask]
+    pa_ending = rows[rows["events"].notna() & (rows["events"] != "")]
+    if pa_ending.empty:
+        return 0.0, 0
+    contact = pa_ending[~pa_ending["events"].isin(_NON_CONTACT_EVENTS)]
+    n_contact = len(contact)
+    if n_contact == 0:
+        return 0.0, 0
+    n_hr = int((contact["events"] == "home_run").sum())
+    return n_hr / n_contact, n_contact
+
+
 def _log5_blend(p_batter: float, p_pitcher: float, p_league: float) -> float:
     """
     Bill James odds-ratio blend of a batter rate and pitcher rate against a
@@ -317,8 +378,13 @@ def _compute_starter_matchup(
     league prior — which makes the log-5 blend degrade to the batter rate
     alone (preserving pre-Fix-B behavior when pitcher data is unavailable).
 
+    Per-pitch HR rate is also modeled: for each pitch type we regress the
+    batter's and pitcher's HR-per-contact toward LEAGUE_HR_PER_CONTACT_BY_PITCH,
+    blend via log-5, and accumulate `weighted_hr_per_contact`. The caller
+    multiplies that by contact rate to get HR/PA.
+
     Returns (weighted_xba, weighted_contact, weighted_p_hit_on_contact,
-             breakdown, overall_data_quality).
+             weighted_hr_per_contact, breakdown, overall_data_quality).
     """
     if not pitcher_arsenal:
         pitcher_arsenal = {"FF": 0.55, "SL": 0.25, "CH": 0.20}
@@ -333,6 +399,7 @@ def _compute_starter_matchup(
     weighted_xba = 0.0
     weighted_contact = 0.0
     weighted_p_hit_on_contact = 0.0
+    weighted_hr_per_contact = 0.0
     total_share = 0.0
 
     for pitch_type, share in pitcher_arsenal.items():
@@ -407,11 +474,33 @@ def _compute_starter_matchup(
             adjusted_contact, pitcher_adjusted_contact, league_contact_for_pitch
         )
 
+        # HR per contact — per-pitch-type modeling. Regress both sides toward
+        # the pitch-specific league prior with HR's heavier K, then log-5 blend.
+        hr_per_contact_prior = LEAGUE_HR_PER_CONTACT_BY_PITCH.get(
+            pitch_type, LEAGUE_AVG_HR_PER_CONTACT
+        )
+        batter_hr_raw, batter_hr_n = _batter_hr_per_contact_for_pitch(
+            batter_df, pitch_type, pitcher_throws
+        )
+        pitcher_hr_raw, pitcher_hr_n = _pitcher_hr_per_contact_for_pitch(
+            pitcher_df, pitch_type, batter_stands
+        )
+        batter_hr_adj = _regress(
+            batter_hr_raw, batter_hr_n, hr_per_contact_prior, k=REGRESSION_K_HR
+        )
+        pitcher_hr_adj = _regress(
+            pitcher_hr_raw, pitcher_hr_n, hr_per_contact_prior, k=REGRESSION_K_HR
+        )
+        blended_hr_per_contact = _log5_blend(
+            batter_hr_adj, pitcher_hr_adj, hr_per_contact_prior
+        )
+
         weighted_xba += share * blended_xba
         weighted_contact += share * blended_contact
         # Mathematically correct composite: weight per-pitch p_hit, don't
         # multiply two independently-weighted averages (they covary).
         weighted_p_hit_on_contact += share * blended_contact * blended_xba
+        weighted_hr_per_contact += share * blended_hr_per_contact
         total_share += share
 
         # Pitch-level matchup hit probability uses the BLENDED rates.
@@ -431,6 +520,10 @@ def _compute_starter_matchup(
             "pitcher_contact": pitcher_adjusted_contact,
             "blended_xba": blended_xba,
             "blended_contact": blended_contact,
+            "batter_hr_per_contact": batter_hr_adj,
+            "pitcher_hr_per_contact": pitcher_hr_adj,
+            "blended_hr_per_contact": blended_hr_per_contact,
+            "league_hr_per_contact": hr_per_contact_prior,
             "hit_prob": pitch_hit_prob,
             "league_xba": xba_prior,
             "league_contact": league_contact_for_pitch,
@@ -446,6 +539,7 @@ def _compute_starter_matchup(
         weighted_xba /= total_share
         weighted_contact /= total_share
         weighted_p_hit_on_contact /= total_share
+        weighted_hr_per_contact /= total_share
 
     if breakdown:
         q_sum = sum(DATA_QUALITY_SCORE[b["data_quality"]] * b["share"] for b in breakdown)
@@ -457,7 +551,14 @@ def _compute_starter_matchup(
     else:
         overall_quality = "no_data"
 
-    return weighted_xba, weighted_contact, weighted_p_hit_on_contact, breakdown, overall_quality
+    return (
+        weighted_xba,
+        weighted_contact,
+        weighted_p_hit_on_contact,
+        weighted_hr_per_contact,
+        breakdown,
+        overall_quality,
+    )
 
 
 def _compute_starter_xba(
@@ -467,7 +568,7 @@ def _compute_starter_xba(
     as_of: date,
 ) -> tuple[float, list[dict]]:
     """Legacy wrapper - returns xBA only for backward compatibility."""
-    xba, _, _, breakdown, _ = _compute_starter_matchup(
+    xba, _, _, _, breakdown, _ = _compute_starter_matchup(
         batter_df, pitcher_throws, pitcher_arsenal, as_of
     )
     return xba, breakdown
@@ -503,7 +604,9 @@ def build_matchup_v2(
     venue: str | None = None,
     umpire_k_dev: float | None = None,
     as_of: date | None = None,
-    pitcher_hr9: float | None = None,
+    pitcher_hr9: float | None = None,  # DEPRECATED: pitcher HR tendency is
+                                       # now modeled via _pitcher_hr_per_contact_for_pitch.
+                                       # Kept for API stability; unused.
     pitcher_df: pd.DataFrame | None = None,
 ) -> MatchupV2:
     """
@@ -525,11 +628,13 @@ def build_matchup_v2(
     """
     as_of = as_of or date.today()
 
-    # Step 1: starter matchup (xBA, contact rate, and composite p_hit, all pitch-mix weighted)
+    # Step 1: starter matchup (xBA, contact rate, composite p_hit, and per-pitch-type
+    # HR-per-contact — all pitch-mix weighted)
     (
         starter_xba_base,
         starter_contact_base,
         starter_p_hit_on_contact_base,
+        starter_hr_per_contact_base,
         starter_breakdown,
         overall_data_quality,
     ) = _compute_starter_matchup(
@@ -557,13 +662,14 @@ def build_matchup_v2(
     ump_dev = umpire_k_dev if umpire_k_dev is not None else 0.0
     ump_xba_adj = -ump_dev * 100 * UMPIRE_K_XBA_SENSITIVITY
 
-    # Batter HR rate from their actual data
-    p_hr_raw = _batter_hr_rate(batter_df)
-
-    # Pitcher-aware HR multiplier: scale batter HR rate by pitcher's HR/9 vs league avg
-    if pitcher_hr9 is not None and pitcher_hr9 > 0:
-        hr_mult = float(np.clip(pitcher_hr9 / LEAGUE_HR_PER_9, 0.5, 2.0))
-        p_hr_raw = p_hr_raw * hr_mult
+    # HR rate per PA: derived from the pitch-mix-weighted HR-per-contact
+    # (batter & pitcher blended via log-5 per pitch type) times the
+    # pitch-mix-weighted contact rate. The flat pitcher_hr9 multiplier is
+    # no longer applied — pitcher HR tendency is already baked into
+    # _pitcher_hr_per_contact_for_pitch; multiplying again would double-count.
+    # pitcher_hr9 is kept in the signature (deprecated) for API stability.
+    _ = pitcher_hr9  # deprecated; intentionally unused
+    p_hr_raw = starter_hr_per_contact_base * starter_contact_base
 
     # Step 5+6: build the per-PA sequence
     pa_probs: list[PAProbability] = []

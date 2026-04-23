@@ -68,6 +68,25 @@ LEAGUE_AVG_K_RATE = 0.225           # Strikeout rate per PA
 LEAGUE_AVG_BB_RATE = 0.085          # Walk rate per PA
 LEAGUE_AVG_CONTACT_RATE = 0.765     # 1 - K_rate - other (balls in play / PA)
 
+# League HR per batted-ball event by pitch type (2024 Baseball Savant).
+# These are HR / (balls in play), NOT HR/PA. Used as regression priors for
+# per-pitch-type HR modeling and as the league baseline in log-5 blending.
+LEAGUE_HR_PER_CONTACT_BY_PITCH = {
+    "FF": 0.055,  # 4-Seam - most homered pitch, especially elevated
+    "SI": 0.038,  # Sinker - lower launch angle, fewer HRs
+    "FC": 0.045,  # Cutter
+    "SL": 0.040,  # Slider
+    "ST": 0.035,  # Sweeper
+    "CU": 0.040,  # Curveball
+    "KC": 0.038,  # Knuckle Curve
+    "CH": 0.052,  # Changeup - flat ones get crushed
+    "FS": 0.040,  # Splitter
+    "FO": 0.035,  # Forkball
+    "SC": 0.040,  # Screwball
+    "EP": 0.050,  # Eephus
+}
+LEAGUE_AVG_HR_PER_CONTACT = 0.043   # ties to existing LEAGUE_AVG_HR_PER_BBE
+
 # Per-pitch-type league averages for xBA AND whiff rates
 # These are critical for realistic simulation
 LEAGUE_XBA_BY_PITCH = {
