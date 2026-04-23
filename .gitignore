@@ -26,3 +26,9 @@ Thumbs.db
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Local fix/spec scratch files
+Fix *.txt
+
+# Claude Code local session dir
+.claude/
