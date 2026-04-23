@@ -24,6 +24,14 @@ from hit_ledger.sim.pitch_sim.zone_model import sample_in_zone
 # no-swing). Keeps HBP a rare outcome instead of ignoring it entirely.
 _HBP_PROB_PER_CALLED_BALL = 0.004
 
+# Times-Through-the-Order effects applied to the PITCHER's profile during
+# starter PAs. As the batter sees the pitcher again, their contact rate
+# and EV both improve, and they chase less out of the zone. Bullpen PAs
+# (tto=0 in the context dict) get no adjustment — they're fresh arms.
+_TTO_WHIFF_MULT = {1: 1.00, 2: 0.93, 3: 0.85}      # pitcher's whiff drops
+_TTO_EV_BONUS = {1: 0.0, 2: 0.8, 3: 1.8}           # mph added to batter EV
+_TTO_O_SWING_MULT = {1: 1.00, 2: 0.97, 3: 0.93}    # batter chases less
+
 
 def simulate_pa(
     batter_profile: dict,
@@ -32,6 +40,7 @@ def simulate_pa(
     park_hr_mult: float = 1.0,
     park_hit_mult: float = 1.0,
     max_pitches: int = 12,
+    pa_context: dict | None = None,
 ) -> dict:
     """
     Simulate a single plate appearance pitch by pitch.
@@ -45,6 +54,14 @@ def simulate_pa(
                         pitch_type, in_zone, swung, contact, foul, ev, la.
                         Fields irrelevant to a given pitch are None.
 
+    `pa_context` (optional) carries game-state that isn't baked into the
+    static profiles: the umpire's K% deviation and the TTO level for
+    starter PAs. Expected keys:
+        tto:        1 | 2 | 3 (starter) or 0 (bullpen — no TTO effect)
+        ump_k_dev:  float, HP ump K% − league K% (same units as matchup_v2)
+        is_bullpen: bool — bullpen PAs skip the TTO adjustments entirely
+    Missing or None context → no adjustments (legacy behavior).
+
     The loop short-circuits on K (3 strikes), BB (4 balls), ball in play,
     or HBP. If `max_pitches` is hit without terminating (very rare), the
     PA is resolved as an out — this is a belt-and-suspenders safety
@@ -52,6 +69,21 @@ def simulate_pa(
     """
     count = (0, 0)
     pitch_sequence: list[dict] = []
+
+    # Derive per-PA adjustments once. Default neutral when context is absent.
+    if pa_context is None:
+        pa_context = {}
+    ump_k_dev = float(pa_context.get("ump_k_dev") or 0.0)
+    tto_level = int(pa_context.get("tto") or 0)
+    is_bullpen = bool(pa_context.get("is_bullpen", tto_level == 0))
+    if is_bullpen or tto_level not in _TTO_WHIFF_MULT:
+        tto_whiff_mult = 1.0
+        tto_ev_bonus = 0.0
+        tto_o_swing_mult = 1.0
+    else:
+        tto_whiff_mult = _TTO_WHIFF_MULT[tto_level]
+        tto_ev_bonus = _TTO_EV_BONUS[tto_level]
+        tto_o_swing_mult = _TTO_O_SWING_MULT[tto_level]
 
     def _record(**kwargs) -> dict:
         entry = {
@@ -77,8 +109,11 @@ def simulate_pa(
 
     for _ in range(max_pitches):
         pt = sample_pitch_type(pitcher_profile, count, rng)
-        in_zone = sample_in_zone(pt, pitcher_profile, count, rng)
-        swung = sample_swing(pt, in_zone, count, batter_profile, rng)
+        in_zone = sample_in_zone(pt, pitcher_profile, count, rng,
+                                 ump_k_dev=ump_k_dev)
+        swung = sample_swing(pt, in_zone, count, batter_profile, rng,
+                             ump_k_dev=ump_k_dev,
+                             tto_o_swing_mult=tto_o_swing_mult)
 
         if not swung:
             _record(pitch_type=pt, in_zone=in_zone, swung=False)
@@ -95,7 +130,8 @@ def simulate_pa(
                     return _result("BB")
             continue
 
-        contact = sample_contact(pt, in_zone, batter_profile, pitcher_profile, rng)
+        contact = sample_contact(pt, in_zone, batter_profile, pitcher_profile, rng,
+                                 tto_whiff_mult=tto_whiff_mult)
         if not contact:
             _record(pitch_type=pt, in_zone=in_zone, swung=True, contact=False)
             count = (count[0], count[1] + 1)
@@ -114,7 +150,8 @@ def simulate_pa(
             continue
 
         # Ball in play — sample EV/LA, apply park, pick final outcome
-        ev, la = sample_ev_la(pt, in_zone, batter_profile, pitcher_profile, rng)
+        ev, la = sample_ev_la(pt, in_zone, batter_profile, pitcher_profile, rng,
+                              tto_ev_bonus=tto_ev_bonus)
         outcome = sample_outcome_from_ev_la(
             ev, la, rng,
             park_hr_mult=park_hr_mult,

@@ -25,8 +25,9 @@ from hit_ledger.config import (
     PA_BY_LINEUP_SLOT,
     RNG_SEED,
 )
+from hit_ledger.config import UMPIRE_K_XBA_SENSITIVITY
 from hit_ledger.sim.engine_v2 import BatterSimResultV2
-from hit_ledger.sim.matchup_v2 import MatchupV2
+from hit_ledger.sim.matchup_v2 import MatchupV2, PAProbability
 from hit_ledger.sim.pitch_sim import simulate_pa
 
 
@@ -37,6 +38,42 @@ def _pas_for_slot(slot: int | None) -> float:
 
 
 _TB_BY_OUTCOME = {"1B": 1, "2B": 2, "3B": 3, "HR": 4}
+
+
+def _tto_level_from_source(source: str) -> int:
+    """Map the PA source tag to a TTO level. Bullpen PAs get level 0 so the
+    pa_engine's TTO adjustments are skipped entirely."""
+    if source == "starter_tto_1":
+        return 1
+    if source == "starter_tto_2":
+        return 2
+    if source == "starter_tto_3":
+        return 3
+    return 0  # "bullpen" or anything else
+
+
+def _build_pa_contexts(m: MatchupV2) -> list[dict]:
+    """Reconstruct per-PA (ump, TTO, bullpen) context from a MatchupV2.
+
+    ump_k_dev is recovered by inverting the transformation in build_matchup_v2:
+        ump_xba_adj = -ump_k_dev * 100 * UMPIRE_K_XBA_SENSITIVITY
+    which means
+        ump_k_dev = -ump_xba_adj / (100 * UMPIRE_K_XBA_SENSITIVITY)
+    We apply the same ump_k_dev to every PA in the game — the home plate
+    umpire is constant across PAs.
+    """
+    if UMPIRE_K_XBA_SENSITIVITY:
+        ump_k_dev = -m.umpire_adjustment / (100 * UMPIRE_K_XBA_SENSITIVITY)
+    else:
+        ump_k_dev = 0.0
+    contexts = []
+    for pa in m.pa_probs:
+        contexts.append({
+            "tto": _tto_level_from_source(pa.source),
+            "ump_k_dev": ump_k_dev,
+            "is_bullpen": pa.source == "bullpen",
+        })
+    return contexts
 
 
 def simulate_pbp(
@@ -103,6 +140,14 @@ def simulate_pbp(
         per_slot_is_starter: list[bool] = [
             pa.source.startswith("starter") for pa in m.pa_probs
         ]
+        per_slot_context: list[dict] = _build_pa_contexts(m)
+        # Fallback context used for deep-extras PAs (beyond pa_probs length):
+        # treat as bullpen, use the ump_k_dev we already recovered, TTO=0.
+        _fallback_context = {
+            "tto": 0,
+            "ump_k_dev": per_slot_context[0]["ump_k_dev"] if per_slot_context else 0.0,
+            "is_bullpen": True,
+        }
 
         hits_per_sim = np.zeros(n_sims, dtype=np.int32)
         tb_per_sim = np.zeros(n_sims, dtype=np.int32)
@@ -113,8 +158,10 @@ def simulate_pbp(
             for pa_idx in range(n_pa):
                 if pa_idx < len(per_slot_is_starter):
                     use_starter = per_slot_is_starter[pa_idx]
+                    ctx = per_slot_context[pa_idx]
                 else:
                     use_starter = False  # deep extras → bullpen
+                    ctx = _fallback_context
                 pitcher_prof = starter_prof if use_starter else bullpen_prof
 
                 result = simulate_pa(
@@ -123,6 +170,7 @@ def simulate_pbp(
                     rng,
                     park_hr_mult=park_hr_mult,
                     park_hit_mult=park_hit_mult,
+                    pa_context=ctx,
                 )
                 outcome = result["outcome"]
                 tb = _TB_BY_OUTCOME.get(outcome, 0)
@@ -164,8 +212,9 @@ def sample_one_trace(
     # We don't know the slot here without a lookup, so just run one PA per
     # source slot the matchup already encodes. That's a reasonable "one
     # game" sample for inspection purposes.
+    contexts = _build_pa_contexts(matchup)
     traces = []
-    for pa in matchup.pa_probs:
+    for pa, ctx in zip(matchup.pa_probs, contexts):
         use_starter = pa.source.startswith("starter")
         pitcher_prof = pitcher_pitch_profile if use_starter else bullpen_pitch_profile
         rec = simulate_pa(
@@ -174,6 +223,7 @@ def sample_one_trace(
             rng,
             park_hr_mult=park_hr_mult,
             park_hit_mult=park_hit_mult,
+            pa_context=ctx,
         )
         rec["source"] = pa.source
         traces.append(rec)

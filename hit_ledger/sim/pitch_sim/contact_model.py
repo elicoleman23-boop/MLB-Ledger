@@ -22,6 +22,7 @@ def sample_contact(
     batter_profile: dict,
     pitcher_profile: dict,
     rng: np.random.Generator,
+    tto_whiff_mult: float = 1.0,
 ) -> bool:
     """
     Log-5 blend of batter contact and pitcher contact-allowed against the
@@ -30,6 +31,10 @@ def sample_contact(
     When the pitcher's whiff for this (pitch, zone) is 0 (treated as
     "no data" by the profile), pitcher_contact defaults to the league
     contact rate so log-5 collapses to the batter's rate cleanly.
+
+    tto_whiff_mult scales the pitcher's whiff rate (batter timing improves
+    later in the game → pitcher whiff drops). <1.0 makes the pitcher less
+    effective at missing bats; values >1.0 would exaggerate whiff.
     """
     if in_zone:
         zone_key = "z"
@@ -48,7 +53,8 @@ def sample_contact(
     if pitcher_whiff is None or pitcher_whiff <= 0.0:
         pitcher_contact = league_contact
     else:
-        pitcher_contact = 1.0 - pitcher_whiff
+        adj_whiff = max(0.0, min(1.0, pitcher_whiff * tto_whiff_mult))
+        pitcher_contact = 1.0 - adj_whiff
 
     blended = _log5_blend(batter_contact, pitcher_contact, league_contact)
     return bool(rng.random() < blended)

@@ -23,6 +23,7 @@ def sample_ev_la(
     batter_profile: dict,
     pitcher_profile: dict,
     rng: np.random.Generator,
+    tto_ev_bonus: float = 0.0,
 ) -> tuple[float, float]:
     """
     Sample a correlated (EV, LA) pair using the Cholesky-like construction:
@@ -32,7 +33,8 @@ def sample_ev_la(
 
     Then apply pitcher-specific EV suppression and LA influence for this
     pitch type, subtract an additional 3 mph for out-of-zone contact,
-    and clip to plausible physical ranges.
+    add a TTO-driven EV bonus (the batter squares up the pitch better
+    each time through the order), and clip to plausible physical ranges.
     """
     block = batter_profile.get("ev_la_by_pitch", {}).get(pitch_type) or {**LEAGUE_EV_LA, "n": 0}
     mean_ev = float(block.get("mean_ev", LEAGUE_EV_LA["mean_ev"]))
@@ -52,6 +54,8 @@ def sample_ev_la(
 
     if not in_zone:
         ev -= _OOZ_EV_SUPPRESSION_MPH
+
+    ev += tto_ev_bonus
 
     ev = float(np.clip(ev, *_EV_CLIP))
     la = float(np.clip(la, *_LA_CLIP))

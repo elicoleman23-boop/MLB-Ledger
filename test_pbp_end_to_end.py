@@ -122,6 +122,7 @@ def main():
 
     max_mean_delta = 0.0
     total_pbp_elapsed = 0.0
+    pbp_scenario_results: list[tuple[str, float, float, float]] = []
 
     for scen in _build_scenarios():
         print("\n" + "-" * 70)
@@ -182,6 +183,10 @@ def main():
         ):
             max_mean_delta = max(max_mean_delta, abs(d))
             print(f"    {label:10s} = {d:+.4f}")
+
+        pbp_scenario_results.append(
+            (scen["name"], pbp.expected_hits, pbp.p_1_hit, pbp.p_1_hr)
+        )
 
     # Runtime benchmark: 10 matchups × 1000 sims
     print("\n" + "-" * 70)
@@ -245,6 +250,68 @@ def main():
         np.random.default_rng(999),
     )
     print(_format_trace(trace))
+
+    # ------------------------------------------------------------------
+    # Gap-1 checks: context (ump + TTO + park) must actually differentiate
+    # pbp outputs across scenarios, AND a single-factor ump change must
+    # move E[hits] in the expected direction.
+    # ------------------------------------------------------------------
+    print("\n" + "-" * 70)
+    print("Gap-1: per-scenario distinctness")
+    print("-" * 70)
+    for name, eh, p1, phr in pbp_scenario_results:
+        print(f"  E[hits]={eh:.4f}  P(1+)={p1:.4f}  P(HR)={phr:.4f}   {name}")
+
+    distinct_eh = {round(r[1], 3) for r in pbp_scenario_results}
+    assert len(distinct_eh) >= 3, (
+        f"Expected ≥3 distinct E[hits] across scenarios (ump+TTO+park should "
+        f"differentiate), got {len(distinct_eh)}: {sorted(distinct_eh)}"
+    )
+    print(f"  distinct E[hits] values: {sorted(distinct_eh)}  OK")
+
+    # Single-factor ump isolation: same matchup inputs except ump_k_dev.
+    # Hitter ump (negative dev, fewer Ks) → more E[hits].
+    print("\n" + "-" * 70)
+    print("Gap-1: ump-only isolation")
+    print("-" * 70)
+
+    def _pbp_with_ump(ump_k_dev: float) -> float:
+        mp_iso = build_matchup_v2(
+            batter_id=12345, batter_df=batter_stat_df, starter_id=67890,
+            starter_throws="R", starter_arsenal=arsenal,
+            starter_workload=_build_scenarios()[0]["starter_workload"],
+            tto_splits=_build_scenarios()[0]["tto_splits"],
+            bullpen_profile=_build_scenarios()[0]["bullpen_profile"],
+            batter_stands="R", lineup_slot=slot, total_pa=total_pa,
+            venue="Yankee Stadium", umpire_k_dev=ump_k_dev,
+            as_of=date(2025, 6, 15), pitcher_df=pitcher_stat_df,
+        )
+        r = simulate_pbp(
+            [mp_iso],
+            batter_pitch_profiles={12345: bp_pitch_profile},
+            pitcher_pitch_profiles={67890: sp_pitch_profile},
+            batter_bullpen_profiles={12345: bullpen_profile},
+            lineup_slots={12345: slot},
+            n_sims=4_000,  # higher n for tighter MC SE on the single-factor check
+            rng=np.random.default_rng(77),
+        )[0]
+        return r.expected_hits
+
+    eh_hitter_ump = _pbp_with_ump(-0.02)   # batter-friendly (fewer Ks)
+    eh_neutral   = _pbp_with_ump(0.0)
+    eh_pitcher_ump = _pbp_with_ump(+0.02)  # pitcher-friendly (more Ks)
+
+    print(f"  ump_k_dev=-0.02 (hitter) : E[hits]={eh_hitter_ump:.4f}")
+    print(f"  ump_k_dev= 0.00 (neutral): E[hits]={eh_neutral:.4f}")
+    print(f"  ump_k_dev=+0.02 (pitcher): E[hits]={eh_pitcher_ump:.4f}")
+
+    # Expected monotone: hitter ump ≥ neutral ≥ pitcher ump. Allow a small
+    # MC slack; the signal should still be directional.
+    assert eh_hitter_ump > eh_pitcher_ump, (
+        f"Hitter ump ({eh_hitter_ump:.4f}) should yield more hits than "
+        f"pitcher ump ({eh_pitcher_ump:.4f})"
+    )
+    print(f"  direction OK  (Δ = {eh_hitter_ump - eh_pitcher_ump:+.4f})")
 
     # Assertions — flag rather than crash on soft calibration drift.
     WARN_DELTA = 0.02
