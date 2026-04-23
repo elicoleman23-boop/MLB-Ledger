@@ -175,7 +175,7 @@ def _cached_pipeline(
     return result
 
 
-def render_sidebar() -> tuple[date, bool, bool, bool, bool, int | None]:
+def render_sidebar() -> tuple[date, bool, bool, bool, bool, int | None, bool]:
     st.sidebar.markdown(
         "<div style='font-family:Fraunces,serif;font-size:1.75rem;"
         "font-weight:800;letter-spacing:-0.02em;margin-bottom:0'>The Hit Ledger</div>"
@@ -197,6 +197,15 @@ def render_sidebar() -> tuple[date, bool, bool, bool, bool, int | None]:
              "Much slower (~20-50× per PA) but walks every pitch with count-aware "
              "logic. Default sims drop to 1000 for tractable runtime; increase to "
              "10000 for final-run quality.",
+    )
+
+    show_detail = st.sidebar.checkbox(
+        "Show pitch-mix detail",
+        value=False,
+        help="Expand each batter row with the per-pitch log-5 breakdown "
+             "(batter vs pitcher vs blended on xBA, contact, and HR/contact), "
+             "PA sequence with TTO labels, and — in pitch-by-pitch mode — a "
+             "sample pitch sequence for that batter.",
     )
 
     # BvP is always enabled now
@@ -241,12 +250,23 @@ def render_sidebar() -> tuple[date, bool, bool, bool, bool, int | None]:
         unsafe_allow_html=True,
     )
 
-    return selected_date, run_clicked, force_refresh, enable_bvp, use_pbp, n_sims
+    return selected_date, run_clicked, force_refresh, enable_bvp, use_pbp, n_sims, show_detail
 
 
-def render_header(selected_date: date):
+def render_header(selected_date: date, engine_mode: str | None = None):
+    badge = ""
+    if engine_mode:
+        badge_bg = "#5a8a6a" if engine_mode == "pbp" else "#3a3a38"
+        badge_label = "pitch-by-pitch" if engine_mode == "pbp" else "fast (PA-level)"
+        badge = (
+            f"<span style='display:inline-block;margin-left:0.75rem;"
+            f"padding:2px 8px;border-radius:10px;background:{badge_bg};"
+            f"font-family:JetBrains Mono,monospace;font-size:0.55rem;"
+            f"color:#0f0f0e;text-transform:uppercase;letter-spacing:0.15em;"
+            f"vertical-align:middle'>{badge_label}</span>"
+        )
     st.markdown(
-        f"<div class='ledger-title'>The Hit Ledger</div>"
+        f"<div class='ledger-title'>The Hit Ledger{badge}</div>"
         f"<div class='ledger-subtitle'>"
         f"Monte Carlo · TTO-aware · {selected_date.strftime('%A, %B %d, %Y')}"
         f"</div>",
@@ -418,6 +438,8 @@ def render_matchup_expanders(
     umpires: dict,
     bvp_annotations: dict,
     pitcher_stats: dict,
+    show_detail: bool = False,
+    pbp_sample_traces: dict | None = None,
 ):
     if games.empty or predictions.empty:
         return
@@ -425,6 +447,15 @@ def render_matchup_expanders(
 
     # Percentile-based grades computed across the full slate
     slate_grades = compute_slate_grades(predictions, matchup_details)
+
+    pbp_sample_traces = pbp_sample_traces or {}
+
+    # Predictions indexed by batter_id for fast lookup in the detail cards
+    pred_by_bid: dict[int, pd.Series] = {}
+    if not predictions.empty:
+        for _, row in predictions.iterrows():
+            if pd.notna(row.get("batter_id")):
+                pred_by_bid[int(row["batter_id"])] = row
 
     # Always show BvP column
     show_bvp = True
@@ -535,6 +566,39 @@ def render_matchup_expanders(
                         column_config=column_config,
                     )
 
+                    # Rich per-batter breakdown cards — hidden by default,
+                    # revealed when "Show pitch-mix detail" is on in the
+                    # sidebar. We render them INSIDE the team column so the
+                    # detail stays visually scoped to its team.
+                    if show_detail:
+                        for _, row in team_rows.iterrows():
+                            batter_id = int(row["batter_id"])
+                            matchup = matchup_details.get(batter_id)
+                            if matchup is None:
+                                continue
+                            raw_name = row.get("batter_name") or f"#{batter_id}"
+                            bats = row.get("bats") or ""
+                            hand_label = ""
+                            if bats:
+                                upper = bats.upper()
+                                if upper == "L":
+                                    hand_label = "LHB"
+                                elif upper == "R":
+                                    hand_label = "RHB"
+                                elif upper == "S":
+                                    hand_label = "SW"
+                            display_name = (
+                                f"{raw_name} ({hand_label})" if hand_label else raw_name
+                            )
+                            slot = int(row["lineup_slot"]) if pd.notna(row["lineup_slot"]) else 0
+                            _render_batter_detail(
+                                display_name=display_name,
+                                slot=slot,
+                                matchup=matchup,
+                                pred_row=pred_by_bid.get(batter_id),
+                                sample_trace=pbp_sample_traces.get(batter_id),
+                            )
+
 
 def _format_umpire_line(ump: dict) -> str:
     if not ump or not ump.get("umpire_name"):
@@ -555,109 +619,185 @@ def _format_umpire_line(ump: dict) -> str:
     )
 
 
-def _render_batter_row(row: pd.Series, matchup, bvp_annotation: str | None):
-    name = row.get("batter_name") or f"Batter #{row['batter_id']}"
-    slot = int(row["lineup_slot"]) if pd.notna(row["lineup_slot"]) else "—"
-    bats = row.get("bats") or "—"
-    p_hit = row.get("p_1_hit")
-    p_hr = row.get("p_1_hr")
-    p_2h = row.get("p_2_hits")
+_SOURCE_LABEL = {
+    "starter_tto_1": "SP TTO1",
+    "starter_tto_2": "SP TTO2",
+    "starter_tto_3": "SP TTO3",
+    "bullpen": "BP",
+}
 
-    hit_s = f"{p_hit * 100:.0f}%" if pd.notna(p_hit) else "—"
-    hr_s = f"{p_hr * 100:.0f}%" if pd.notna(p_hr) else "—"
-    two_s = f"{p_2h * 100:.0f}%" if pd.notna(p_2h) else "—"
+_QUALITY_COLOR = {
+    "strong": "#5a8a6a",
+    "good": "#d4a24c",
+    "limited": "#a07040",
+    "no_data": "#5a5a5a",
+}
 
-    bvp_html = (
-        f"<div style='font-family:JetBrains Mono,monospace;"
-        f"font-size:0.65rem;color:#d4a24c;padding-left:1.5rem;margin-top:2px'>"
-        f"BvP: {bvp_annotation}</div>"
-        if bvp_annotation else ""
-    )
+
+def _render_batter_detail(
+    display_name: str,
+    slot: int,
+    matchup,
+    pred_row: pd.Series | None,
+    sample_trace: list | None,
+):
+    """One compact rich card per batter: PA sequence with TTO labels, the
+    full log-5 pitch-mix breakdown (batter / pitcher / blended on xBA,
+    contact, HR-per-contact), and a sample pitch sequence when pbp mode
+    ran this batter."""
+    # Header line — slot, name, overall data_quality, top-line prob summary
+    p_hit = pred_row.get("p_1_hit") if pred_row is not None else None
+    p_hr = pred_row.get("p_1_hr") if pred_row is not None else None
+    p_2h = pred_row.get("p_2_hits") if pred_row is not None else None
+    hit_s = f"{p_hit * 100:.0f}%" if p_hit is not None and pd.notna(p_hit) else "—"
+    hr_s = f"{p_hr * 100:.0f}%" if p_hr is not None and pd.notna(p_hr) else "—"
+    two_s = f"{p_2h * 100:.0f}%" if p_2h is not None and pd.notna(p_2h) else "—"
+
+    quality = getattr(matchup, "data_quality", None) or "good"
+    q_color = _QUALITY_COLOR.get(quality, "#8a8679")
 
     header = (
-        f"<div style='display:flex;justify-content:space-between;"
-        f"padding:0.5rem 0;border-bottom:1px solid #2d2d2b'>"
-        f"<div><span style='font-family:JetBrains Mono,monospace;color:#8a8679'>{slot}.</span> "
-        f"<span style='font-family:Fraunces,serif;font-weight:600'>{name}</span> "
-        f"<span style='font-family:JetBrains Mono,monospace;color:#8a8679;font-size:0.75rem'>"
-        f"({bats})</span></div>"
-        f"<div style='font-family:JetBrains Mono,monospace;font-size:0.85rem'>"
+        "<div style='display:flex;justify-content:space-between;align-items:center;"
+        "padding:0.5rem 0 0.25rem 0;border-bottom:1px solid #2d2d2b;margin-top:0.75rem'>"
+        f"<div>"
+        f"<span style='font-family:JetBrains Mono,monospace;color:#8a8679'>{slot}.</span> "
+        f"<span style='font-family:Fraunces,serif;font-weight:600;color:#e8e4d8'>{display_name}</span> "
+        f"<span style='font-family:JetBrains Mono,monospace;font-size:0.6rem;"
+        f"color:{q_color};text-transform:uppercase;letter-spacing:0.1em;margin-left:0.5rem'>"
+        f"[{quality}]</span>"
+        "</div>"
+        "<div style='font-family:JetBrains Mono,monospace;font-size:0.75rem;color:#8a8679'>"
         f"<span style='color:#d4a24c'>1H {hit_s}</span> · "
         f"<span>2H {two_s}</span> · "
         f"<span>HR {hr_s}</span>"
-        f"</div></div>"
-        f"{bvp_html}"
+        "</div></div>"
     )
     st.markdown(header, unsafe_allow_html=True)
 
-    if matchup is not None:
-        _render_matchup_details(matchup)
-
-
-def _render_matchup_details(matchup):
+    # PA sequence
     pa_rows = []
     for i, pa in enumerate(matchup.pa_probs, 1):
-        source_label = {
-            "starter_tto_1": "Starter (1st TTO)",
-            "starter_tto_2": "Starter (2nd TTO)",
-            "starter_tto_3": "Starter (3rd TTO)",
-            "bullpen": "Bullpen",
-        }.get(pa.source, pa.source)
+        src_label = _SOURCE_LABEL.get(pa.source, pa.source)
         color = "#5a8a6a" if "bullpen" in pa.source else "#d4a24c"
         pa_rows.append(
-            f"<div style='font-family:JetBrains Mono,monospace;font-size:0.68rem;"
-            f"color:#8a8679;padding-left:1.5rem'>"
-            f"PA {i} · <span style='color:{color}'>{source_label}</span> · "
+            "<div style='font-family:JetBrains Mono,monospace;font-size:0.68rem;"
+            "color:#8a8679;padding-left:1rem'>"
+            f"PA {i} · <span style='color:{color}'>{src_label}</span> · "
             f"<span style='color:#e8e4d8'>P(hit)={pa.p_hit:.3f}</span> · "
             f"P(HR)={pa.p_hr:.3f}"
-            f"</div>"
+            "</div>"
         )
 
     ctx_bits = [
         f"{matchup.expected_pa_vs_starter:.1f} PA vs SP",
-        f"{matchup.expected_pa_vs_bullpen:.1f} PA vs BP (xBA {matchup.bullpen_xba:.3f})",
+        f"{matchup.expected_pa_vs_bullpen:.1f} PA vs BP",
     ]
-    if matchup.umpire_adjustment != 0:
-        sign = "+" if matchup.umpire_adjustment >= 0 else ""
-        ctx_bits.append(f"Ump {sign}{matchup.umpire_adjustment:.4f} xBA")
+    if matchup.bullpen_xba is not None:
+        ctx_bits[-1] += f" (xBA {matchup.bullpen_xba:.3f})"
+    if matchup.umpire_adjustment:
+        # Reverse-convert the xBA adj back to K% deviation for readability.
+        from hit_ledger.config import UMPIRE_K_XBA_SENSITIVITY
+        k_dev_pp = (-matchup.umpire_adjustment / UMPIRE_K_XBA_SENSITIVITY)
+        sign = "+" if k_dev_pp >= 0 else ""
+        ctx_bits.append(f"Ump {sign}{k_dev_pp:.1f}pp K")
     ctx_line = (
-        f"<div style='font-family:JetBrains Mono,monospace;font-size:0.65rem;"
-        f"color:#8a8679;padding-left:1.5rem;margin-top:2px;"
-        f"text-transform:uppercase;letter-spacing:0.1em'>"
+        "<div style='font-family:JetBrains Mono,monospace;font-size:0.6rem;"
+        "color:#8a8679;padding-left:1rem;margin-top:2px;text-transform:uppercase;"
+        "letter-spacing:0.1em'>"
         f"{' · '.join(ctx_bits)}"
-        f"</div>"
+        "</div>"
     )
 
-    mix_rows = []
+    # Pitch-mix rows with batter / pitcher / blended columns.
+    # Uses a monospace layout so aligned columns read like a table.
+    mix_rows = [
+        "<div style='font-family:JetBrains Mono,monospace;font-size:0.62rem;"
+        "color:#6f6e68;padding-left:1rem;margin-top:6px;"
+        "text-transform:uppercase;letter-spacing:0.08em'>"
+        "Pitch-mix log-5 (batter · pitcher · blended)"
+        "</div>"
+    ]
+    # Header row
+    mix_rows.append(
+        "<div style='font-family:JetBrains Mono,monospace;font-size:0.66rem;"
+        "color:#8a8679;padding-left:1rem'>"
+        "<code>"
+        "Pt  Mix    xBA  B/P/Bl             Ct  B/P/Bl             "
+        "HR/C B/P/Bl          Edge   n(B/P)"
+        "</code></div>"
+    )
     for b in matchup.starter_breakdown:
-        edge = b["edge"]
+        edge = b.get("edge", 0.0)
         edge_cls = "matchup-edge-pos" if edge > 0 else "matchup-edge-neg"
-        mix_rows.append(
-            f"<div style='font-family:JetBrains Mono,monospace;font-size:0.68rem;"
-            f"color:#8a8679;padding-left:1.5rem'>"
-            f"<span style='color:#e8e4d8'>{b['pitch_type']}</span> "
-            f"· mix {b['share'] * 100:.0f}% "
-            f"· xBA <span style='color:#e8e4d8'>{b['batter_xba']:.3f}</span> "
-            f"· lg {b['league_xba']:.3f} "
-            f"· edge <span class='{edge_cls}'>{edge:+.3f}</span> "
-            f"· n={b['sample_pitches']}"
-            f"</div>"
+        row = (
+            "<div style='font-family:JetBrains Mono,monospace;font-size:0.66rem;"
+            "color:#8a8679;padding-left:1rem'>"
+            "<code>"
+            f"{b['pitch_type']:3s}"
+            f"{b['share'] * 100:4.0f}%  "
+            f"{b.get('batter_xba', 0):.3f}/{b.get('pitcher_xba', 0):.3f}/"
+            f"<span style='color:#e8e4d8'>{b.get('blended_xba', 0):.3f}</span>  "
+            f"{b.get('batter_contact', 0):.2f}/{b.get('pitcher_contact', 0):.2f}/"
+            f"<span style='color:#e8e4d8'>{b.get('blended_contact', 0):.2f}</span>  "
+            f"{b.get('batter_hr_per_contact', 0):.3f}/"
+            f"{b.get('pitcher_hr_per_contact', 0):.3f}/"
+            f"<span style='color:#e8e4d8'>{b.get('blended_hr_per_contact', 0):.3f}</span>  "
+            f"<span class='{edge_cls}'>{edge:+.3f}</span>  "
+            f"{b.get('sample_pitches', 0)}/{b.get('pitcher_sample_pitches', 0)}"
+            "</code></div>"
         )
+        mix_rows.append(row)
 
     st.markdown("".join(pa_rows), unsafe_allow_html=True)
     st.markdown(ctx_line, unsafe_allow_html=True)
-    st.markdown(
-        "<div style='font-family:JetBrains Mono,monospace;font-size:0.6rem;"
-        "color:#8a8679;padding-left:1.5rem;margin-top:6px;"
-        "text-transform:uppercase;letter-spacing:0.1em'>Pitch mix vs starter</div>",
-        unsafe_allow_html=True,
-    )
     st.markdown("".join(mix_rows), unsafe_allow_html=True)
+
+    # Optional sample PA trace (pitch-by-pitch mode only)
+    if sample_trace:
+        st.markdown(
+            "<div style='font-family:JetBrains Mono,monospace;font-size:0.62rem;"
+            "color:#6f6e68;padding-left:1rem;margin-top:8px;"
+            "text-transform:uppercase;letter-spacing:0.08em'>"
+            "Sample pitch-by-pitch PA trace"
+            "</div>",
+            unsafe_allow_html=True,
+        )
+        trace_rows = []
+        for pa_i, pa in enumerate(sample_trace, 1):
+            src = _SOURCE_LABEL.get(pa.get("source", ""), pa.get("source", ""))
+            pa_header = (
+                "<div style='font-family:JetBrains Mono,monospace;font-size:0.68rem;"
+                "color:#e8e4d8;padding-left:1rem;margin-top:2px'>"
+                f"PA {pa_i} <span style='color:#8a8679'>({src})</span> → "
+                f"<span style='color:#d4a24c'>{pa['outcome']}</span> · "
+                f"count {pa['final_count']} · {pa['n_pitches']} pitches"
+                "</div>"
+            )
+            trace_rows.append(pa_header)
+            for i, p in enumerate(pa["pitch_sequence"], 1):
+                if p["swung"]:
+                    if p["contact"]:
+                        act = ("foul" if p["foul"]
+                               else f"BIP ev={p['ev']:.0f} la={p['la']:.0f}")
+                    else:
+                        act = "whiff"
+                else:
+                    act = "take"
+                zone = "Z" if p["in_zone"] else "O"
+                trace_rows.append(
+                    "<div style='font-family:JetBrains Mono,monospace;font-size:0.64rem;"
+                    "color:#8a8679;padding-left:2rem'>"
+                    f"{i}. {p['pitch_type']:3s}[{zone}]  {act}"
+                    "</div>"
+                )
+        st.markdown("".join(trace_rows), unsafe_allow_html=True)
 
 
 def main():
-    selected_date, run_clicked, force_refresh, enable_bvp, use_pbp, n_sims = render_sidebar()
-    render_header(selected_date)
+    (
+        selected_date, run_clicked, force_refresh, enable_bvp,
+        use_pbp, n_sims, show_detail,
+    ) = render_sidebar()
 
     predictions = cache.load_predictions(selected_date)
     games = cache.load_games(selected_date)
@@ -667,6 +807,7 @@ def main():
     umpires: dict = {}
     pitcher_stats: dict = {}
     pbp_sample_traces: dict = {}
+    engine_mode: str | None = None
 
     if run_clicked or force_refresh:
         if force_refresh:
@@ -686,10 +827,10 @@ def main():
         umpires = result.umpires
         pitcher_stats = getattr(result, 'pitcher_stats', {})
         pbp_sample_traces = getattr(result, 'pbp_sample_traces', {}) or {}
-        mode_tag = result.summary.get("mode", "fast")
+        engine_mode = result.summary.get("mode", "fast")
         st.sidebar.success(
             f"Ran {result.summary.get('n_matchups', 0)} matchups across "
-            f"{result.summary.get('n_games', 0)} games ({mode_tag} engine)"
+            f"{result.summary.get('n_games', 0)} games ({engine_mode} engine)"
         )
 
         if not predictions.empty and "p_1_hit" in predictions.columns:
@@ -705,6 +846,12 @@ def main():
                     unsafe_allow_html=True,
                 )
 
+    # Inferred engine mode from cached data when a run hasn't fired yet.
+    if engine_mode is None and pbp_sample_traces:
+        engine_mode = "pbp"
+
+    render_header(selected_date, engine_mode=engine_mode)
+
     # Today's Slate at the top
     render_games_table(games, umpires)
 
@@ -715,72 +862,13 @@ def main():
 
     st.markdown("---")
 
-    # Matchup breakdowns
+    # Matchup breakdowns (rich per-batter cards enabled via sidebar toggle)
     render_matchup_expanders(
-        games, lineups_df, predictions, matchup_details, umpires, bvp_annotations, pitcher_stats
+        games, lineups_df, predictions, matchup_details,
+        umpires, bvp_annotations, pitcher_stats,
+        show_detail=show_detail,
+        pbp_sample_traces=pbp_sample_traces,
     )
-
-    if pbp_sample_traces:
-        st.markdown("---")
-        render_pbp_sample_traces(pbp_sample_traces, lineups_df)
-
-
-def render_pbp_sample_traces(traces: dict, lineups: pd.DataFrame):
-    """Collapsible per-batter expander showing one pitch-by-pitch PA trace.
-    Populated only when the pitch-by-pitch engine was used."""
-    st.markdown("### Sample PA traces (pitch-by-pitch)")
-    st.markdown(
-        "<div style='font-family:JetBrains Mono,monospace;font-size:0.7rem;"
-        "color:#8a8679;margin-bottom:0.5rem'>"
-        "One sampled game per batter. Click a name to see the pitch sequence."
-        "</div>",
-        unsafe_allow_html=True,
-    )
-
-    name_by_bid: dict[int, str] = {}
-    if not lineups.empty:
-        for _, row in lineups.iterrows():
-            bid = int(row["batter_id"]) if pd.notna(row["batter_id"]) else None
-            if bid is not None:
-                name_by_bid[bid] = row.get("batter_name") or f"Batter #{bid}"
-
-    for bid, pa_list in traces.items():
-        label = name_by_bid.get(bid, f"Batter #{bid}")
-        with st.expander(f"{label}  ·  {len(pa_list)} PA sample"):
-            for pa_i, pa in enumerate(pa_list, 1):
-                header = (
-                    f"<div style='font-family:JetBrains Mono,monospace;"
-                    f"font-size:0.75rem;color:#e8e4d8;margin-top:0.4rem'>"
-                    f"PA {pa_i} ({pa.get('source', '?')}) → "
-                    f"<span style='color:#d4a24c'>{pa['outcome']}</span> "
-                    f"at count {pa['final_count']} · {pa['n_pitches']} pitches"
-                    f"</div>"
-                )
-                st.markdown(header, unsafe_allow_html=True)
-                rows = []
-                for i, p in enumerate(pa["pitch_sequence"], 1):
-                    action_bits = []
-                    if p["swung"]:
-                        if p["contact"]:
-                            if p["foul"]:
-                                action_bits.append("foul")
-                            else:
-                                action_bits.append(
-                                    f"BIP ev={p['ev']:.0f} la={p['la']:.0f}"
-                                )
-                        else:
-                            action_bits.append("whiff")
-                    else:
-                        action_bits.append("take")
-                    zone = "Z" if p["in_zone"] else "O"
-                    rows.append(
-                        f"<div style='font-family:JetBrains Mono,monospace;"
-                        f"font-size:0.68rem;color:#8a8679;padding-left:1.2rem'>"
-                        f"{i}. {p['pitch_type']:3s}  [{zone}]  "
-                        f"{' · '.join(action_bits)}"
-                        f"</div>"
-                    )
-                st.markdown("".join(rows), unsafe_allow_html=True)
 
 
 if __name__ == "__main__":
