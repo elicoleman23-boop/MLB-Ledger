@@ -126,7 +126,11 @@ st.markdown(CSS, unsafe_allow_html=True)
 
 @st.cache_data(show_spinner=False)
 def _cached_pipeline(
-    game_date_iso: str, force_refresh: bool = False, enable_bvp: bool = False
+    game_date_iso: str,
+    force_refresh: bool = False,
+    enable_bvp: bool = False,
+    use_pbp: bool = False,
+    n_sims: int | None = None,
 ):
     game_date = date.fromisoformat(game_date_iso)
     progress_ph = st.sidebar.empty()
@@ -163,13 +167,15 @@ def _cached_pipeline(
         progress=progress_cb,
         force_refresh=force_refresh,
         enable_bvp=enable_bvp,
+        use_pbp=use_pbp,
+        n_sims=n_sims,
     )
     progress_bar.empty()
     progress_ph.empty()
     return result
 
 
-def render_sidebar() -> tuple[date, bool, bool, bool]:
+def render_sidebar() -> tuple[date, bool, bool, bool, bool, int | None]:
     st.sidebar.markdown(
         "<div style='font-family:Fraunces,serif;font-size:1.75rem;"
         "font-weight:800;letter-spacing:-0.02em;margin-bottom:0'>The Hit Ledger</div>"
@@ -184,6 +190,15 @@ def render_sidebar() -> tuple[date, bool, bool, bool]:
     )
     run_clicked = st.sidebar.button("Run Engine", use_container_width=True)
 
+    use_pbp = st.sidebar.checkbox(
+        "Realistic sim (pitch-by-pitch)",
+        value=False,
+        help="Swap the fast PA-level engine for the pitch-by-pitch sim. "
+             "Much slower (~20-50× per PA) but walks every pitch with count-aware "
+             "logic. Default sims drop to 1000 for tractable runtime; increase to "
+             "10000 for final-run quality.",
+    )
+
     # BvP is always enabled now
     enable_bvp = True
 
@@ -192,6 +207,15 @@ def render_sidebar() -> tuple[date, bool, bool, bool]:
             "Force refresh (ignore cache)", value=False,
             help="Re-scrape all Statcast data. Slow.",
         )
+        if use_pbp:
+            n_sims = st.number_input(
+                "PBP sims per batter",
+                min_value=100, max_value=20_000, value=1_000, step=100,
+                help="Higher = smoother probabilities but slower. 1000 is the "
+                     "speed/quality sweet spot for interactive use.",
+            )
+        else:
+            n_sims = None
         if st.button("Clear prediction cache for this date"):
             with cache._connect() as conn:  # noqa: SLF001
                 conn.execute(
@@ -201,20 +225,23 @@ def render_sidebar() -> tuple[date, bool, bool, bool]:
             st.cache_data.clear()
             st.success("Cleared.")
 
+    sims_line = f"Sims per batter: {n_sims or 1_000}" if use_pbp else "Sims per batter: 10,000"
+    mode_line = "Mode: pitch-by-pitch" if use_pbp else "Mode: fast (PA-level)"
     st.sidebar.markdown(
         "<div style='margin-top:2rem;padding-top:1rem;border-top:1px solid #2d2d2b;"
         "font-family:JetBrains Mono,monospace;font-size:0.65rem;color:#8a8679'>"
+        f"{mode_line}<br>"
         "Model: xBA × pitch-mix<br>"
         "Regression: k=200<br>"
         "Recency blend: 70/30<br>"
         "TTO: pitcher-specific + fallback<br>"
         "Bullpen: team xBA by handedness<br>"
-        "Sims per batter: 10,000"
+        f"{sims_line}"
         "</div>",
         unsafe_allow_html=True,
     )
 
-    return selected_date, run_clicked, force_refresh, enable_bvp
+    return selected_date, run_clicked, force_refresh, enable_bvp, use_pbp, n_sims
 
 
 def render_header(selected_date: date):
@@ -629,7 +656,7 @@ def _render_matchup_details(matchup):
 
 
 def main():
-    selected_date, run_clicked, force_refresh, enable_bvp = render_sidebar()
+    selected_date, run_clicked, force_refresh, enable_bvp, use_pbp, n_sims = render_sidebar()
     render_header(selected_date)
 
     predictions = cache.load_predictions(selected_date)
@@ -639,6 +666,7 @@ def main():
     bvp_annotations: dict = {}
     umpires: dict = {}
     pitcher_stats: dict = {}
+    pbp_sample_traces: dict = {}
 
     if run_clicked or force_refresh:
         if force_refresh:
@@ -647,6 +675,8 @@ def main():
             selected_date.isoformat(),
             force_refresh=force_refresh,
             enable_bvp=enable_bvp,
+            use_pbp=use_pbp,
+            n_sims=n_sims,
         )
         predictions = result.predictions
         games = result.games
@@ -655,9 +685,11 @@ def main():
         bvp_annotations = result.bvp_annotations
         umpires = result.umpires
         pitcher_stats = getattr(result, 'pitcher_stats', {})
+        pbp_sample_traces = getattr(result, 'pbp_sample_traces', {}) or {}
+        mode_tag = result.summary.get("mode", "fast")
         st.sidebar.success(
             f"Ran {result.summary.get('n_matchups', 0)} matchups across "
-            f"{result.summary.get('n_games', 0)} games"
+            f"{result.summary.get('n_games', 0)} games ({mode_tag} engine)"
         )
 
         if not predictions.empty and "p_1_hit" in predictions.columns:
@@ -687,6 +719,68 @@ def main():
     render_matchup_expanders(
         games, lineups_df, predictions, matchup_details, umpires, bvp_annotations, pitcher_stats
     )
+
+    if pbp_sample_traces:
+        st.markdown("---")
+        render_pbp_sample_traces(pbp_sample_traces, lineups_df)
+
+
+def render_pbp_sample_traces(traces: dict, lineups: pd.DataFrame):
+    """Collapsible per-batter expander showing one pitch-by-pitch PA trace.
+    Populated only when the pitch-by-pitch engine was used."""
+    st.markdown("### Sample PA traces (pitch-by-pitch)")
+    st.markdown(
+        "<div style='font-family:JetBrains Mono,monospace;font-size:0.7rem;"
+        "color:#8a8679;margin-bottom:0.5rem'>"
+        "One sampled game per batter. Click a name to see the pitch sequence."
+        "</div>",
+        unsafe_allow_html=True,
+    )
+
+    name_by_bid: dict[int, str] = {}
+    if not lineups.empty:
+        for _, row in lineups.iterrows():
+            bid = int(row["batter_id"]) if pd.notna(row["batter_id"]) else None
+            if bid is not None:
+                name_by_bid[bid] = row.get("batter_name") or f"Batter #{bid}"
+
+    for bid, pa_list in traces.items():
+        label = name_by_bid.get(bid, f"Batter #{bid}")
+        with st.expander(f"{label}  ·  {len(pa_list)} PA sample"):
+            for pa_i, pa in enumerate(pa_list, 1):
+                header = (
+                    f"<div style='font-family:JetBrains Mono,monospace;"
+                    f"font-size:0.75rem;color:#e8e4d8;margin-top:0.4rem'>"
+                    f"PA {pa_i} ({pa.get('source', '?')}) → "
+                    f"<span style='color:#d4a24c'>{pa['outcome']}</span> "
+                    f"at count {pa['final_count']} · {pa['n_pitches']} pitches"
+                    f"</div>"
+                )
+                st.markdown(header, unsafe_allow_html=True)
+                rows = []
+                for i, p in enumerate(pa["pitch_sequence"], 1):
+                    action_bits = []
+                    if p["swung"]:
+                        if p["contact"]:
+                            if p["foul"]:
+                                action_bits.append("foul")
+                            else:
+                                action_bits.append(
+                                    f"BIP ev={p['ev']:.0f} la={p['la']:.0f}"
+                                )
+                        else:
+                            action_bits.append("whiff")
+                    else:
+                        action_bits.append("take")
+                    zone = "Z" if p["in_zone"] else "O"
+                    rows.append(
+                        f"<div style='font-family:JetBrains Mono,monospace;"
+                        f"font-size:0.68rem;color:#8a8679;padding-left:1.2rem'>"
+                        f"{i}. {p['pitch_type']:3s}  [{zone}]  "
+                        f"{' · '.join(action_bits)}"
+                        f"</div>"
+                    )
+                st.markdown("".join(rows), unsafe_allow_html=True)
 
 
 if __name__ == "__main__":

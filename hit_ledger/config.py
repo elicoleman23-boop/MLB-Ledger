@@ -57,6 +57,13 @@ DEFAULT_PA = 4.2  # fallback if lineup slot unknown
 N_SIMULATIONS = 10_000
 RNG_SEED = None  # set an int for reproducibility during debugging
 
+# Pitch-by-pitch simulator (Fix E Phase 3). When True, the pipeline swaps
+# engine_v2.simulate_v2 for pitch_sim_engine.simulate_pbp. The pbp engine
+# is ~20-50x slower than the fast path because every pitch walks through
+# Python; default n_sims should drop to ~1000 to keep a slate under ~30s.
+USE_PITCH_BY_PITCH_SIM = False
+PBP_DEFAULT_N_SIMS = 1_000
+
 # Game-level multiplicative noise on non-HR hit probabilities — one draw
 # per simulated game, shared across all PAs. Models persistent within-game
 # effects (weather, umpire, defensive form). Centered at 1.0 so means are
@@ -93,6 +100,56 @@ LEAGUE_HR_PER_CONTACT_BY_PITCH = {
     "EP": 0.050,  # Eephus
 }
 LEAGUE_AVG_HR_PER_CONTACT = 0.043   # ties to existing LEAGUE_AVG_HR_PER_BBE
+
+# ---------------------------------------------------------------------------
+# Pitch-by-pitch sim (Fix E) — league priors for swing/contact rates and
+# batted-ball EV/LA distributions. Used when batter or pitcher has too few
+# samples in a (pitch_type, zone) split to trust the observed rate.
+# Values are public Baseball Savant splits for 2024; refresh annually.
+# ---------------------------------------------------------------------------
+
+# Minimum PA-ending contact events needed to trust a per-pitch-type EV/LA
+# distribution. Below this, fall back to the batter's overall EV/LA, then
+# to LEAGUE_EV_LA.
+MIN_EV_LA_SAMPLE = 40
+
+# League-wide batted-ball distribution (all pitch types pooled). Used as the
+# ultimate fallback when per-pitch and overall samples are both too sparse.
+LEAGUE_EV_LA = {
+    "mean_ev": 88.5,   # mph
+    "sd_ev": 13.5,
+    "mean_la": 12.0,   # degrees
+    "sd_la": 27.0,
+    "corr_ev_la": -0.05,
+}
+
+# P(swing | in-zone) per pitch type
+LEAGUE_Z_SWING_BY_PITCH = {
+    "FF": 0.72, "SI": 0.75, "FC": 0.70, "SL": 0.63, "ST": 0.60,
+    "CU": 0.58, "KC": 0.60, "CH": 0.66, "FS": 0.64, "FO": 0.58,
+    "SC": 0.62, "EP": 0.55,
+}
+
+# P(swing | out-of-zone) per pitch type
+LEAGUE_O_SWING_BY_PITCH = {
+    "FF": 0.22, "SI": 0.26, "FC": 0.28, "SL": 0.36, "ST": 0.38,
+    "CU": 0.28, "KC": 0.30, "CH": 0.34, "FS": 0.38, "FO": 0.34,
+    "SC": 0.30, "EP": 0.15,
+}
+
+# P(contact | swing, in-zone) per pitch type
+LEAGUE_Z_CONTACT_BY_PITCH = {
+    "FF": 0.88, "SI": 0.90, "FC": 0.85, "SL": 0.78, "ST": 0.75,
+    "CU": 0.82, "KC": 0.80, "CH": 0.82, "FS": 0.78, "FO": 0.78,
+    "SC": 0.82, "EP": 0.85,
+}
+
+# P(contact | swing, out-of-zone) per pitch type
+LEAGUE_O_CONTACT_BY_PITCH = {
+    "FF": 0.70, "SI": 0.72, "FC": 0.65, "SL": 0.52, "ST": 0.48,
+    "CU": 0.60, "KC": 0.58, "CH": 0.62, "FS": 0.55, "FO": 0.55,
+    "SC": 0.60, "EP": 0.65,
+}
 
 # Per-pitch-type league averages for xBA AND whiff rates
 # These are critical for realistic simulation

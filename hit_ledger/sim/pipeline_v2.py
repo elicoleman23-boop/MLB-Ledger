@@ -22,7 +22,16 @@ from typing import Any, Callable
 
 import pandas as pd
 
-from hit_ledger.config import BVP_DEFAULT_ENABLED, PA_BY_LINEUP_SLOT, DEFAULT_PA
+from hit_ledger.config import (
+    BVP_DEFAULT_ENABLED,
+    DEFAULT_PA,
+    N_SIMULATIONS,
+    PA_BY_LINEUP_SLOT,
+    PARK_FACTORS_HITS,
+    PARK_FACTORS_HR,
+    PBP_DEFAULT_N_SIMS,
+    USE_PITCH_BY_PITCH_SIM,
+)
 from hit_ledger.data import cache, lineups, statcast
 from hit_ledger.data import bullpen as bullpen_data
 from hit_ledger.data import pitcher_profile as pitcher_profile_data
@@ -31,6 +40,12 @@ from hit_ledger.data import umpires as umpire_data
 from hit_ledger.data import bvp as bvp_data
 from hit_ledger.sim.engine_v2 import results_to_df_v2, simulate_v2
 from hit_ledger.sim.matchup_v2 import build_matchup_v2
+from hit_ledger.sim.pitch_sim import (
+    build_batter_pitch_profile,
+    build_pitcher_pitch_profile,
+)
+from hit_ledger.sim.pitch_sim.bullpen_aggregator import build_team_bullpen_pitch_profile
+from hit_ledger.sim.pitch_sim_engine import sample_one_trace, simulate_pbp
 from hit_ledger.utils.teams import TEAM_SHORT_TO_FULL
 
 logger = logging.getLogger(__name__)
@@ -54,6 +69,10 @@ class PipelineResultV2:
     umpires: dict          # game_pk -> umpire info
     pitcher_stats: dict    # pitcher_id -> stats dict
     summary: dict
+    # Fix E Phase 3: populated only when use_pbp=True. batter_id → one
+    # full PA trace (list of dicts from pa_engine.simulate_pa with each PA's
+    # pitch_sequence) for UI inspection.
+    pbp_sample_traces: dict = None  # type: ignore[assignment]
 
 
 def run_daily_pipeline_v2(
@@ -61,8 +80,16 @@ def run_daily_pipeline_v2(
     progress: ProgressCallback | None = None,
     force_refresh: bool = False,
     enable_bvp: bool = BVP_DEFAULT_ENABLED,
+    use_pbp: bool = USE_PITCH_BY_PITCH_SIM,
+    n_sims: int | None = None,
 ) -> PipelineResultV2:
-    """Full v2 pipeline."""
+    """Full v2 pipeline.
+
+    When `use_pbp=True`, the fast PA-level engine is replaced by the
+    pitch-by-pitch simulator (hit_ledger.sim.pitch_sim_engine.simulate_pbp).
+    Everything upstream (data fetch, matchup build) is unchanged so a
+    single pipeline supports both modes.
+    """
     _tick(progress, "schedule", 0.0)
 
     # 1-2. Schedule & lineups
@@ -153,6 +180,11 @@ def run_daily_pipeline_v2(
     batter_to_game = {}
     batter_to_slot = {}
     bvp_annotations = {}
+    # Per-batter pbp routing: opposing team for bullpen lookup, venue for park
+    batter_to_opp_team: dict[int, str] = {}
+    batter_to_venue: dict[int, str | None] = {}
+    # Per-batter pbp starter profile selection
+    batter_to_starter_id: dict[int, int] = {}
 
     for _, row in lineups_df.iterrows():
         bid = int(row["batter_id"])
@@ -209,6 +241,9 @@ def run_daily_pipeline_v2(
         matchups.append(matchup)
         batter_to_game[bid] = game_pk
         batter_to_slot[bid] = slot
+        batter_to_opp_team[bid] = opp_team
+        batter_to_venue[bid] = game_info.get("venue")
+        batter_to_starter_id[bid] = opp_pitcher_id
 
         # 10. BvP annotations (display only)
         if enable_bvp:
@@ -219,9 +254,74 @@ def run_daily_pipeline_v2(
 
     _tick(progress, "matchups", 1.0)
 
-    # Simulate
+    # Simulate — fast PA-level or pitch-by-pitch depending on use_pbp
     _tick(progress, "simulate", 0.0)
-    sim_results = simulate_v2(matchups, batter_to_slot)
+    pbp_sample_traces: dict = {}
+    if use_pbp:
+        # Build pitch profiles. Batter profiles come from the Statcast
+        # frames we already fetched; pitcher profiles likewise.
+        batter_pitch_profiles = {
+            bid: build_batter_pitch_profile(df)
+            for bid, df in batter_profiles.items()
+        }
+        pitcher_pitch_profiles: dict[int, dict] = {}
+        for pid in pitcher_ids:
+            df = pitcher_profiles.get(pid, pd.DataFrame())
+            arsenal_info = pitcher_data.get(pid)
+            arsenal = arsenal_info[1] if arsenal_info else {}
+            pitcher_pitch_profiles[pid] = build_pitcher_pitch_profile(df, arsenal)
+
+        # Stopgap bullpen profile per team: no per-reliever data yet, so
+        # every team's bullpen gets the same league-prior profile.
+        # (Fix F replaces this with per-reliever profiles + usage weighting.)
+        team_names = set(batter_to_opp_team.values())
+        team_bullpen_profiles = {
+            team: build_team_bullpen_pitch_profile([], {}, {})
+            for team in team_names
+        }
+        batter_bullpen_profiles = {
+            bid: team_bullpen_profiles.get(team, {})
+            for bid, team in batter_to_opp_team.items()
+        }
+
+        # Park multipliers per batter
+        batter_park_mults: dict[int, tuple[float, float]] = {}
+        for bid, venue in batter_to_venue.items():
+            batter_park_mults[bid] = (
+                PARK_FACTORS_HITS.get(venue or "", PARK_FACTORS_HITS["_default"]),
+                PARK_FACTORS_HR.get(venue or "", PARK_FACTORS_HR["_default"]),
+            )
+
+        effective_n_sims = n_sims if n_sims is not None else PBP_DEFAULT_N_SIMS
+        sim_results = simulate_pbp(
+            matchups,
+            batter_pitch_profiles=batter_pitch_profiles,
+            pitcher_pitch_profiles=pitcher_pitch_profiles,
+            batter_bullpen_profiles=batter_bullpen_profiles,
+            lineup_slots=batter_to_slot,
+            n_sims=effective_n_sims,
+            batter_park_mults=batter_park_mults,
+        )
+
+        # One sample trace per batter, for UI inspection. Cheap: a single
+        # PA-per-matchup-slot walk per batter, not n_sims worth.
+        import numpy as np  # noqa: PLC0415 — tight local scope
+        trace_rng = np.random.default_rng(7)
+        for m in matchups:
+            bid = m.batter_id
+            pbp_sample_traces[bid] = sample_one_trace(
+                matchup=m,
+                batter_pitch_profile=batter_pitch_profiles.get(bid, {}),
+                pitcher_pitch_profile=pitcher_pitch_profiles.get(m.starter_id, {}),
+                bullpen_pitch_profile=batter_bullpen_profiles.get(bid, {}),
+                rng=trace_rng,
+                park_hit_mult=batter_park_mults.get(bid, (1.0, 1.0))[0],
+                park_hr_mult=batter_park_mults.get(bid, (1.0, 1.0))[1],
+            )
+    else:
+        effective_n_sims = n_sims if n_sims is not None else N_SIMULATIONS
+        sim_results = simulate_v2(matchups, batter_to_slot, n_sims=effective_n_sims)
+
     preds_df = results_to_df_v2(sim_results)
 
     if not preds_df.empty:
@@ -240,7 +340,8 @@ def run_daily_pipeline_v2(
         bvp_annotations=bvp_annotations,
         umpires=umpires,
         pitcher_stats=pitcher_stats_cache,
-        summary={**summary, "n_matchups": len(matchups)},
+        summary={**summary, "n_matchups": len(matchups), "mode": "pbp" if use_pbp else "fast"},
+        pbp_sample_traces=pbp_sample_traces,
     )
 
 
