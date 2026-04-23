@@ -155,6 +155,16 @@ def simulate_v2(
             # Per-PA independent noise averages out across 4-5 PAs per game
             # and yields near-zero dispersion growth; a single per-game draw
             # is a first-order model of the persistent effects.
+            # TODO(game-sim): When full game simulation is built, this batter-level
+            # noise will be combined with team-level noise (one draw per team per 
+            # game, shared across all 9 batters in the lineup, modeling starter's
+            # "stuff today" and defensive form) and game-level noise (one draw per 
+            # game, shared across both teams, modeling weather/umpire/park). The 
+            # combined per-PA multiplier = game_noise * team_noise * batter_noise. 
+            # Team-level correlation is what produces realistic fat tails on team 
+            # total runs (the 9-batter lineup correlation matters more than the 
+            # 4-PA batter correlation).
+
             noise = rng.normal(
                 loc=1.0, scale=babip_noise_sd, size=(n_sims, 1)
             )
@@ -163,8 +173,8 @@ def simulate_v2(
             noisy_i = np.broadcast_to(
                 static_probs[i][None, :, :], (n_sims, sim_max_pa, 5)
             ).copy()
-            # Scale 1B/2B/3B slots by per-(sim, PA) noise; HR (slot 4) unchanged
-            noise_3d = noise[:, :, None]  # (n_sims, sim_max_pa, 1)
+            # Scale 1B/2B/3B slots by per-(batter, sim) noise shared across all PAs
+            noise_3d = noise[:, :, None]  # (n_sims, 1, 1)
             noisy_i[:, :, 1:4] *= noise_3d
             # Recompute out prob = 1 - (hits + HR), clip total hit prob
             total_hit = noisy_i[:, :, 1:].sum(axis=2)

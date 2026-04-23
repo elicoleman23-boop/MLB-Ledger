@@ -62,7 +62,7 @@ RNG_SEED = None  # set an int for reproducibility during debugging
 # effects (weather, umpire, defensive form). Centered at 1.0 so means are
 # preserved; variance/dispersion grows, producing realistic fat tails for
 # team totals and alt-line markets. Set to 0 for deterministic runs.
-BABIP_NOISE_SD = 0.08  # 8% relative noise on non-HR hit prob
+BABIP_NOISE_SD = 0.12  # 8% relative noise on non-HR hit prob
 
 # ---------------------------------------------------------------------------
 # League-average priors (used for shrinkage)
