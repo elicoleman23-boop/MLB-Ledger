@@ -27,7 +27,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-from hit_ledger.config import BVP_DEFAULT_ENABLED, HOT_LIST_SIZE, LEAGUE_AVG_XBA
+from hit_ledger.config import BVP_DEFAULT_ENABLED, LEAGUE_AVG_XBA
 from hit_ledger.data import cache
 from hit_ledger.sim.pipeline_v2 import run_daily_pipeline_v2
 from hit_ledger.ui.styles import CSS
@@ -175,7 +175,7 @@ def _cached_pipeline(
     return result
 
 
-def render_sidebar() -> tuple[date, bool, bool, bool, bool, int | None, bool]:
+def render_sidebar() -> tuple[date, bool, bool, bool, bool, int | None]:
     st.sidebar.markdown(
         "<div style='font-family:Fraunces,serif;font-size:1.75rem;"
         "font-weight:800;letter-spacing:-0.02em;margin-bottom:0'>The Hit Ledger</div>"
@@ -196,16 +196,8 @@ def render_sidebar() -> tuple[date, bool, bool, bool, bool, int | None, bool]:
         help="Swap the fast PA-level engine for the pitch-by-pitch sim. "
              "Much slower (~20-50× per PA) but walks every pitch with count-aware "
              "logic. Default sims drop to 1000 for tractable runtime; increase to "
-             "10000 for final-run quality.",
-    )
-
-    show_detail = st.sidebar.checkbox(
-        "Show pitch-mix detail",
-        value=False,
-        help="Expand each batter row with the per-pitch log-5 breakdown "
-             "(batter vs pitcher vs blended on xBA, contact, and HR/contact), "
-             "PA sequence with TTO labels, and — in pitch-by-pitch mode — a "
-             "sample pitch sequence for that batter.",
+             "10000 for final-run quality. Also unlocks the full category set on "
+             "the Leaderboards tab.",
     )
 
     # BvP is always enabled now
@@ -250,7 +242,7 @@ def render_sidebar() -> tuple[date, bool, bool, bool, bool, int | None, bool]:
         unsafe_allow_html=True,
     )
 
-    return selected_date, run_clicked, force_refresh, enable_bvp, use_pbp, n_sims, show_detail
+    return selected_date, run_clicked, force_refresh, enable_bvp, use_pbp, n_sims
 
 
 def render_header(selected_date: date, engine_mode: str | None = None):
@@ -272,100 +264,6 @@ def render_header(selected_date: date, engine_mode: str | None = None):
         f"</div>",
         unsafe_allow_html=True,
     )
-
-
-def render_hot_list(
-    predictions: pd.DataFrame,
-    lineups: pd.DataFrame,
-    games: pd.DataFrame,
-    bvp_annotations: dict,
-):
-    if predictions.empty:
-        st.info("No predictions yet. Click **Run Engine** in the sidebar.")
-        return
-
-    df = predictions.merge(
-        lineups[["batter_id", "batter_name", "team", "lineup_slot", "bats"]],
-        on="batter_id", how="left",
-    )
-    df = df.merge(
-        games[["game_pk", "home_team", "away_team", "venue"]],
-        on="game_pk", how="left",
-    )
-
-    st.markdown("### Top 5 Picks")
-
-    # Create tabs for different categories
-    tab_hit, tab_tb, tab_hr = st.tabs(["1+ Hit", "2+ TB", "HR"])
-
-    def build_table(sorted_df, bvp_annotations):
-        table_data = []
-        for _, row in sorted_df.iterrows():
-            batter_id = int(row["batter_id"])
-            raw_name = row.get("batter_name") or f"Batter #{batter_id}"
-            bats = row.get("bats") or ""
-            hand_label = ""
-            if bats:
-                if bats.upper() == "L":
-                    hand_label = "LHB"
-                elif bats.upper() == "R":
-                    hand_label = "RHB"
-                elif bats.upper() == "S":
-                    hand_label = "SW"
-
-            if hand_label:
-                display_name = f"{raw_name} ({hand_label})"
-            else:
-                display_name = raw_name
-
-            hit_val = row['p_1_hit'] * 100 if pd.notna(row.get('p_1_hit')) else 0
-            tb_val = row['p_tb_over_1_5'] * 100 if pd.notna(row.get('p_tb_over_1_5')) else 0
-            hr_val = row['p_1_hr'] * 100 if pd.notna(row.get('p_1_hr')) else 0
-
-            # Get BvP annotation
-            bvp = bvp_annotations.get(batter_id, "—")
-
-            table_data.append({
-                "Name": display_name,
-                "1H%": hit_val,
-                "2TB%": tb_val,
-                "HR%": hr_val,
-                "BvP": bvp if bvp else "—",
-            })
-        return pd.DataFrame(table_data)
-
-    column_config = {
-        "1H%": st.column_config.NumberColumn(format="%.0f%%"),
-        "2TB%": st.column_config.NumberColumn(format="%.0f%%"),
-        "HR%": st.column_config.NumberColumn(format="%.0f%%"),
-    }
-
-    with tab_hit:
-        top_hit = df.sort_values("p_1_hit", ascending=False).head(HOT_LIST_SIZE)
-        st.dataframe(
-            build_table(top_hit, bvp_annotations),
-            use_container_width=True,
-            hide_index=True,
-            column_config=column_config,
-        )
-
-    with tab_tb:
-        top_tb = df.sort_values("p_tb_over_1_5", ascending=False).head(HOT_LIST_SIZE)
-        st.dataframe(
-            build_table(top_tb, bvp_annotations),
-            use_container_width=True,
-            hide_index=True,
-            column_config=column_config,
-        )
-
-    with tab_hr:
-        top_hr = df.sort_values("p_1_hr", ascending=False).head(HOT_LIST_SIZE)
-        st.dataframe(
-            build_table(top_hr, bvp_annotations),
-            use_container_width=True,
-            hide_index=True,
-            column_config=column_config,
-        )
 
 
 def render_games_table(games: pd.DataFrame, umpires: dict):
@@ -438,8 +336,6 @@ def render_matchup_expanders(
     umpires: dict,
     bvp_annotations: dict,
     pitcher_stats: dict,
-    show_detail: bool = False,
-    pbp_sample_traces: dict | None = None,
 ):
     if games.empty or predictions.empty:
         return
@@ -447,15 +343,6 @@ def render_matchup_expanders(
 
     # Percentile-based grades computed across the full slate
     slate_grades = compute_slate_grades(predictions, matchup_details)
-
-    pbp_sample_traces = pbp_sample_traces or {}
-
-    # Predictions indexed by batter_id for fast lookup in the detail cards
-    pred_by_bid: dict[int, pd.Series] = {}
-    if not predictions.empty:
-        for _, row in predictions.iterrows():
-            if pd.notna(row.get("batter_id")):
-                pred_by_bid[int(row["batter_id"])] = row
 
     # Always show BvP column
     show_bvp = True
@@ -566,39 +453,6 @@ def render_matchup_expanders(
                         column_config=column_config,
                     )
 
-                    # Rich per-batter breakdown cards — hidden by default,
-                    # revealed when "Show pitch-mix detail" is on in the
-                    # sidebar. We render them INSIDE the team column so the
-                    # detail stays visually scoped to its team.
-                    if show_detail:
-                        for _, row in team_rows.iterrows():
-                            batter_id = int(row["batter_id"])
-                            matchup = matchup_details.get(batter_id)
-                            if matchup is None:
-                                continue
-                            raw_name = row.get("batter_name") or f"#{batter_id}"
-                            bats = row.get("bats") or ""
-                            hand_label = ""
-                            if bats:
-                                upper = bats.upper()
-                                if upper == "L":
-                                    hand_label = "LHB"
-                                elif upper == "R":
-                                    hand_label = "RHB"
-                                elif upper == "S":
-                                    hand_label = "SW"
-                            display_name = (
-                                f"{raw_name} ({hand_label})" if hand_label else raw_name
-                            )
-                            slot = int(row["lineup_slot"]) if pd.notna(row["lineup_slot"]) else 0
-                            _render_batter_detail(
-                                display_name=display_name,
-                                slot=slot,
-                                matchup=matchup,
-                                pred_row=pred_by_bid.get(batter_id),
-                                sample_trace=pbp_sample_traces.get(batter_id),
-                            )
-
 
 def _format_umpire_line(ump: dict) -> str:
     if not ump or not ump.get("umpire_name"):
@@ -619,184 +473,219 @@ def _format_umpire_line(ump: dict) -> str:
     )
 
 
-_SOURCE_LABEL = {
-    "starter_tto_1": "SP TTO1",
-    "starter_tto_2": "SP TTO2",
-    "starter_tto_3": "SP TTO3",
-    "bullpen": "BP",
-}
+# ---------------------------------------------------------------------------
+# Leaderboards tab
+# ---------------------------------------------------------------------------
+# Category definitions. `key` is the dict key on batter_outcomes /
+# pitcher_outcomes (both produced by the pbp engine). `kind` drives
+# formatting: "pct" renders as percentage, "mean" as float.
+# `min_engine` controls availability: "fast" means also computable from
+# BatterSimResultV2, "pbp" means only the pitch-by-pitch engine produces
+# the number.
 
-_QUALITY_COLOR = {
-    "strong": "#5a8a6a",
-    "good": "#d4a24c",
-    "limited": "#a07040",
-    "no_data": "#5a5a5a",
-}
+BATTER_CATEGORIES = [
+    # label,                   outcome key,        kind,  min_engine
+    ("1+ Hit",                 "p_1_hit",          "pct",  "fast"),
+    ("2+ Hits",                "p_2_hits",         "pct",  "fast"),
+    ("3+ Hits",                "p_3_hits",         "pct",  "pbp"),
+    ("1+ Single",              "p_1_single",       "pct",  "pbp"),
+    ("2+ Singles",             "p_2_singles",      "pct",  "pbp"),
+    ("1+ Double",              "p_1_double",       "pct",  "pbp"),
+    ("1+ Triple",              "p_1_triple",       "pct",  "pbp"),
+    ("1+ HR",                  "p_1_hr",           "pct",  "fast"),
+    ("2+ HR",                  "p_2_hr",           "pct",  "pbp"),
+    ("1+ Walk",                "p_1_walk",         "pct",  "pbp"),
+    ("2+ Walks",               "p_2_walks",        "pct",  "pbp"),
+    ("1+ Strikeout",           "p_1_k",            "pct",  "pbp"),
+    ("2+ Strikeouts",          "p_2_k",            "pct",  "pbp"),
+    ("1+ HBP",                 "p_1_hbp",          "pct",  "pbp"),
+    ("2+ Total Bases",         "p_tb_2",           "pct",  "pbp"),
+    ("3+ Total Bases",         "p_tb_3",           "pct",  "pbp"),
+    ("4+ Total Bases",         "p_tb_4",           "pct",  "pbp"),
+    ("Expected Hits",          "expected_hits",    "mean", "fast"),
+    ("Expected Total Bases",   "expected_tb",      "mean", "fast"),
+]
+
+PITCHER_CATEGORIES = [
+    # label,              outcome key,     kind,  min_engine
+    ("Expected Ks (SP)",  "expected_k",    "mean", "pbp"),
+]
+
+LEADERBOARD_TOP_N = 10
 
 
-def _render_batter_detail(
-    display_name: str,
-    slot: int,
-    matchup,
-    pred_row: pd.Series | None,
-    sample_trace: list | None,
-):
-    """One compact rich card per batter: PA sequence with TTO labels, the
-    full log-5 pitch-mix breakdown (batter / pitcher / blended on xBA,
-    contact, HR-per-contact), and a sample pitch sequence when pbp mode
-    ran this batter."""
-    # Header line — slot, name, overall data_quality, top-line prob summary
-    p_hit = pred_row.get("p_1_hit") if pred_row is not None else None
-    p_hr = pred_row.get("p_1_hr") if pred_row is not None else None
-    p_2h = pred_row.get("p_2_hits") if pred_row is not None else None
-    hit_s = f"{p_hit * 100:.0f}%" if p_hit is not None and pd.notna(p_hit) else "—"
-    hr_s = f"{p_hr * 100:.0f}%" if p_hr is not None and pd.notna(p_hr) else "—"
-    two_s = f"{p_2h * 100:.0f}%" if p_2h is not None and pd.notna(p_2h) else "—"
+def _fast_mode_batter_outcomes_from_preds(
+    predictions: pd.DataFrame,
+) -> dict[int, dict[str, float]]:
+    """In fast mode the engine doesn't produce per-threshold outcome dicts;
+    build a compatible dict from the BatterSimResultV2 columns instead so
+    the leaderboard code has one uniform input shape."""
+    if predictions.empty:
+        return {}
+    out: dict[int, dict[str, float]] = {}
+    for _, row in predictions.iterrows():
+        if pd.isna(row.get("batter_id")):
+            continue
+        bid = int(row["batter_id"])
+        out[bid] = {
+            "p_1_hit":       float(row["p_1_hit"])        if pd.notna(row.get("p_1_hit")) else 0.0,
+            "p_2_hits":      float(row["p_2_hits"])       if pd.notna(row.get("p_2_hits")) else 0.0,
+            "p_1_hr":        float(row["p_1_hr"])         if pd.notna(row.get("p_1_hr")) else 0.0,
+            "p_tb_2":        float(row["p_tb_over_1_5"])  if pd.notna(row.get("p_tb_over_1_5")) else 0.0,
+            "p_tb_3":        float(row["p_tb_over_2_5"])  if pd.notna(row.get("p_tb_over_2_5")) else 0.0,
+            "expected_hits": float(row["expected_hits"])  if pd.notna(row.get("expected_hits")) else 0.0,
+            "expected_tb":   float(row["expected_tb"])    if pd.notna(row.get("expected_tb")) else 0.0,
+        }
+    return out
 
-    quality = getattr(matchup, "data_quality", None) or "good"
-    q_color = _QUALITY_COLOR.get(quality, "#8a8679")
 
-    header = (
-        "<div style='display:flex;justify-content:space-between;align-items:center;"
-        "padding:0.5rem 0 0.25rem 0;border-bottom:1px solid #2d2d2b;margin-top:0.75rem'>"
-        f"<div>"
-        f"<span style='font-family:JetBrains Mono,monospace;color:#8a8679'>{slot}.</span> "
-        f"<span style='font-family:Fraunces,serif;font-weight:600;color:#e8e4d8'>{display_name}</span> "
-        f"<span style='font-family:JetBrains Mono,monospace;font-size:0.6rem;"
-        f"color:{q_color};text-transform:uppercase;letter-spacing:0.1em;margin-left:0.5rem'>"
-        f"[{quality}]</span>"
-        "</div>"
-        "<div style='font-family:JetBrains Mono,monospace;font-size:0.75rem;color:#8a8679'>"
-        f"<span style='color:#d4a24c'>1H {hit_s}</span> · "
-        f"<span>2H {two_s}</span> · "
-        f"<span>HR {hr_s}</span>"
-        "</div></div>"
-    )
-    st.markdown(header, unsafe_allow_html=True)
+def _batter_name_map(lineups: pd.DataFrame) -> dict[int, tuple[str, str]]:
+    """batter_id → (name, team_short) for leaderboard row labels."""
+    out: dict[int, tuple[str, str]] = {}
+    if lineups.empty:
+        return out
+    for _, row in lineups.iterrows():
+        if pd.isna(row.get("batter_id")):
+            continue
+        bid = int(row["batter_id"])
+        name = row.get("batter_name") or f"Batter #{bid}"
+        team = row.get("team") or ""
+        out[bid] = (name, team)
+    return out
 
-    # PA sequence
-    pa_rows = []
-    for i, pa in enumerate(matchup.pa_probs, 1):
-        src_label = _SOURCE_LABEL.get(pa.source, pa.source)
-        color = "#5a8a6a" if "bullpen" in pa.source else "#d4a24c"
-        pa_rows.append(
-            "<div style='font-family:JetBrains Mono,monospace;font-size:0.68rem;"
-            "color:#8a8679;padding-left:1rem'>"
-            f"PA {i} · <span style='color:{color}'>{src_label}</span> · "
-            f"<span style='color:#e8e4d8'>P(hit)={pa.p_hit:.3f}</span> · "
-            f"P(HR)={pa.p_hr:.3f}"
-            "</div>"
-        )
 
-    ctx_bits = [
-        f"{matchup.expected_pa_vs_starter:.1f} PA vs SP",
-        f"{matchup.expected_pa_vs_bullpen:.1f} PA vs BP",
-    ]
-    if matchup.bullpen_xba is not None:
-        ctx_bits[-1] += f" (xBA {matchup.bullpen_xba:.3f})"
-    if matchup.umpire_adjustment:
-        # Reverse-convert the xBA adj back to K% deviation for readability.
-        from hit_ledger.config import UMPIRE_K_XBA_SENSITIVITY
-        k_dev_pp = (-matchup.umpire_adjustment / UMPIRE_K_XBA_SENSITIVITY)
-        sign = "+" if k_dev_pp >= 0 else ""
-        ctx_bits.append(f"Ump {sign}{k_dev_pp:.1f}pp K")
-    ctx_line = (
-        "<div style='font-family:JetBrains Mono,monospace;font-size:0.6rem;"
-        "color:#8a8679;padding-left:1rem;margin-top:2px;text-transform:uppercase;"
-        "letter-spacing:0.1em'>"
-        f"{' · '.join(ctx_bits)}"
-        "</div>"
-    )
-
-    # Pitch-mix rows with batter / pitcher / blended columns.
-    # Uses a monospace layout so aligned columns read like a table.
-    mix_rows = [
-        "<div style='font-family:JetBrains Mono,monospace;font-size:0.62rem;"
-        "color:#6f6e68;padding-left:1rem;margin-top:6px;"
-        "text-transform:uppercase;letter-spacing:0.08em'>"
-        "Pitch-mix log-5 (batter · pitcher · blended)"
-        "</div>"
-    ]
-    # Header row
-    mix_rows.append(
-        "<div style='font-family:JetBrains Mono,monospace;font-size:0.66rem;"
-        "color:#8a8679;padding-left:1rem'>"
-        "<code>"
-        "Pt  Mix    xBA  B/P/Bl             Ct  B/P/Bl             "
-        "HR/C B/P/Bl          Edge   n(B/P)"
-        "</code></div>"
-    )
-    for b in matchup.starter_breakdown:
-        edge = b.get("edge", 0.0)
-        edge_cls = "matchup-edge-pos" if edge > 0 else "matchup-edge-neg"
-        row = (
-            "<div style='font-family:JetBrains Mono,monospace;font-size:0.66rem;"
-            "color:#8a8679;padding-left:1rem'>"
-            "<code>"
-            f"{b['pitch_type']:3s}"
-            f"{b['share'] * 100:4.0f}%  "
-            f"{b.get('batter_xba', 0):.3f}/{b.get('pitcher_xba', 0):.3f}/"
-            f"<span style='color:#e8e4d8'>{b.get('blended_xba', 0):.3f}</span>  "
-            f"{b.get('batter_contact', 0):.2f}/{b.get('pitcher_contact', 0):.2f}/"
-            f"<span style='color:#e8e4d8'>{b.get('blended_contact', 0):.2f}</span>  "
-            f"{b.get('batter_hr_per_contact', 0):.3f}/"
-            f"{b.get('pitcher_hr_per_contact', 0):.3f}/"
-            f"<span style='color:#e8e4d8'>{b.get('blended_hr_per_contact', 0):.3f}</span>  "
-            f"<span class='{edge_cls}'>{edge:+.3f}</span>  "
-            f"{b.get('sample_pitches', 0)}/{b.get('pitcher_sample_pitches', 0)}"
-            "</code></div>"
-        )
-        mix_rows.append(row)
-
-    st.markdown("".join(pa_rows), unsafe_allow_html=True)
-    st.markdown(ctx_line, unsafe_allow_html=True)
-    st.markdown("".join(mix_rows), unsafe_allow_html=True)
-
-    # Optional sample PA trace (pitch-by-pitch mode only)
-    if sample_trace:
-        st.markdown(
-            "<div style='font-family:JetBrains Mono,monospace;font-size:0.62rem;"
-            "color:#6f6e68;padding-left:1rem;margin-top:8px;"
-            "text-transform:uppercase;letter-spacing:0.08em'>"
-            "Sample pitch-by-pitch PA trace"
-            "</div>",
-            unsafe_allow_html=True,
-        )
-        trace_rows = []
-        for pa_i, pa in enumerate(sample_trace, 1):
-            src = _SOURCE_LABEL.get(pa.get("source", ""), pa.get("source", ""))
-            pa_header = (
-                "<div style='font-family:JetBrains Mono,monospace;font-size:0.68rem;"
-                "color:#e8e4d8;padding-left:1rem;margin-top:2px'>"
-                f"PA {pa_i} <span style='color:#8a8679'>({src})</span> → "
-                f"<span style='color:#d4a24c'>{pa['outcome']}</span> · "
-                f"count {pa['final_count']} · {pa['n_pitches']} pitches"
-                "</div>"
+def _pitcher_name_map(
+    games: pd.DataFrame,
+    pitcher_stats: dict,
+) -> dict[int, tuple[str, str]]:
+    """pitcher_id → (name_or_id, team_short). pitcher_stats may carry a
+    'name' / 'full_name' / 'player_name' field depending on source; fall
+    back to "#<id>" when nothing surfaces."""
+    out: dict[int, tuple[str, str]] = {}
+    if games.empty:
+        return out
+    for _, g in games.iterrows():
+        for pid_col, team_col in (
+            ("home_pitcher_id", "home_team"),
+            ("away_pitcher_id", "away_team"),
+        ):
+            pid = g.get(pid_col)
+            if pid is None or pd.isna(pid):
+                continue
+            pid = int(pid)
+            stats = pitcher_stats.get(pid, {}) or {}
+            name = (
+                stats.get("name")
+                or stats.get("full_name")
+                or stats.get("player_name")
+                or f"Pitcher #{pid}"
             )
-            trace_rows.append(pa_header)
-            for i, p in enumerate(pa["pitch_sequence"], 1):
-                if p["swung"]:
-                    if p["contact"]:
-                        act = ("foul" if p["foul"]
-                               else f"BIP ev={p['ev']:.0f} la={p['la']:.0f}")
-                    else:
-                        act = "whiff"
-                else:
-                    act = "take"
-                zone = "Z" if p["in_zone"] else "O"
-                trace_rows.append(
-                    "<div style='font-family:JetBrains Mono,monospace;font-size:0.64rem;"
-                    "color:#8a8679;padding-left:2rem'>"
-                    f"{i}. {p['pitch_type']:3s}[{zone}]  {act}"
-                    "</div>"
-                )
-        st.markdown("".join(trace_rows), unsafe_allow_html=True)
+            team = g.get(team_col) or ""
+            out[pid] = (name, team)
+    return out
+
+
+def _format_value(value: float, kind: str) -> str:
+    if kind == "pct":
+        return f"{value * 100:.1f}%"
+    return f"{value:.2f}"
+
+
+def _render_category_leaderboard(
+    label: str,
+    rows: list[tuple[str, str, float]],
+    kind: str,
+):
+    """rows = [(name, team, value)], already truncated to TOP_N and sorted."""
+    with st.expander(label, expanded=False):
+        if not rows:
+            st.markdown(
+                "<div style='font-family:JetBrains Mono,monospace;font-size:0.7rem;"
+                "color:#8a8679'>No data available for this slate.</div>",
+                unsafe_allow_html=True,
+            )
+            return
+        table = pd.DataFrame([
+            {
+                "#": i + 1,
+                "Player": name,
+                "Team": team,
+                "Value": _format_value(val, kind),
+            }
+            for i, (name, team, val) in enumerate(rows)
+        ])
+        st.dataframe(table, use_container_width=True, hide_index=True)
+
+
+def render_leaderboards(
+    engine_mode: str,
+    batter_outcomes: dict[int, dict[str, float]],
+    pitcher_outcomes: dict[int, dict[str, float]],
+    lineups: pd.DataFrame,
+    games: pd.DataFrame,
+    pitcher_stats: dict,
+):
+    """Stacked expanders, one per category. Batter leaderboards first,
+    then pitcher categories. Categories that require pbp are hidden in
+    fast mode instead of showing an empty list."""
+    st.markdown(
+        "<div style='font-family:JetBrains Mono,monospace;font-size:0.7rem;"
+        "color:#8a8679;margin-bottom:0.5rem'>"
+        f"Top {LEADERBOARD_TOP_N} per category. Expand any row to see the "
+        f"ranked players and their simulated percentages or expected counts."
+        "</div>",
+        unsafe_allow_html=True,
+    )
+
+    if not batter_outcomes and not pitcher_outcomes:
+        st.info(
+            "Run the engine to populate the leaderboards. Enable "
+            "**Realistic sim (pitch-by-pitch)** in the sidebar to unlock "
+            "the full category set."
+        )
+        return
+
+    batter_names = _batter_name_map(lineups)
+    pitcher_names = _pitcher_name_map(games, pitcher_stats)
+
+    # Batter section
+    st.markdown("#### Batters")
+    for label, key, kind, min_engine in BATTER_CATEGORIES:
+        if min_engine == "pbp" and engine_mode != "pbp":
+            continue
+        rows: list[tuple[str, str, float]] = []
+        for bid, outcomes in batter_outcomes.items():
+            if key not in outcomes:
+                continue
+            name, team = batter_names.get(bid, (f"Batter #{bid}", ""))
+            rows.append((name, team, outcomes[key]))
+        rows.sort(key=lambda r: r[2], reverse=True)
+        _render_category_leaderboard(label, rows[:LEADERBOARD_TOP_N], kind)
+
+    # Pitcher section — only shown when there's at least one pbp category
+    # available (currently only E[K] and only in pbp mode).
+    pitcher_visible = [
+        (label, key, kind, min_engine)
+        for (label, key, kind, min_engine) in PITCHER_CATEGORIES
+        if not (min_engine == "pbp" and engine_mode != "pbp")
+    ]
+    if pitcher_visible and pitcher_outcomes:
+        st.markdown("#### Pitchers (starters)")
+        for label, key, kind, _ in pitcher_visible:
+            rows: list[tuple[str, str, float]] = []
+            for pid, outcomes in pitcher_outcomes.items():
+                if key not in outcomes:
+                    continue
+                name, team = pitcher_names.get(pid, (f"Pitcher #{pid}", ""))
+                rows.append((name, team, outcomes[key]))
+            rows.sort(key=lambda r: r[2], reverse=True)
+            _render_category_leaderboard(label, rows[:LEADERBOARD_TOP_N], kind)
 
 
 def main():
     (
         selected_date, run_clicked, force_refresh, enable_bvp,
-        use_pbp, n_sims, show_detail,
+        use_pbp, n_sims,
     ) = render_sidebar()
 
     predictions = cache.load_predictions(selected_date)
@@ -806,7 +695,8 @@ def main():
     bvp_annotations: dict = {}
     umpires: dict = {}
     pitcher_stats: dict = {}
-    pbp_sample_traces: dict = {}
+    batter_outcomes: dict = {}
+    pitcher_outcomes: dict = {}
     engine_mode: str | None = None
 
     if run_clicked or force_refresh:
@@ -826,7 +716,8 @@ def main():
         bvp_annotations = result.bvp_annotations
         umpires = result.umpires
         pitcher_stats = getattr(result, 'pitcher_stats', {})
-        pbp_sample_traces = getattr(result, 'pbp_sample_traces', {}) or {}
+        batter_outcomes = getattr(result, 'batter_outcomes', {}) or {}
+        pitcher_outcomes = getattr(result, 'pitcher_outcomes', {}) or {}
         engine_mode = result.summary.get("mode", "fast")
         st.sidebar.success(
             f"Ran {result.summary.get('n_matchups', 0)} matchups across "
@@ -846,29 +737,35 @@ def main():
                     unsafe_allow_html=True,
                 )
 
-    # Inferred engine mode from cached data when a run hasn't fired yet.
-    if engine_mode is None and pbp_sample_traces:
-        engine_mode = "pbp"
+    if engine_mode is None:
+        engine_mode = "fast"
+
+    # Fast-mode leaderboard feed is derived from predictions — the fast
+    # engine doesn't produce the wide outcome dict natively.
+    if engine_mode == "fast" and not batter_outcomes:
+        batter_outcomes = _fast_mode_batter_outcomes_from_preds(predictions)
 
     render_header(selected_date, engine_mode=engine_mode)
 
-    # Today's Slate at the top
-    render_games_table(games, umpires)
+    tab_matchups, tab_leaderboards = st.tabs(["Matchups", "Leaderboards"])
 
-    st.markdown("---")
+    with tab_matchups:
+        render_games_table(games, umpires)
+        st.markdown("---")
+        render_matchup_expanders(
+            games, lineups_df, predictions, matchup_details,
+            umpires, bvp_annotations, pitcher_stats,
+        )
 
-    # Top 5 picks table
-    render_hot_list(predictions, lineups_df, games, bvp_annotations)
-
-    st.markdown("---")
-
-    # Matchup breakdowns (rich per-batter cards enabled via sidebar toggle)
-    render_matchup_expanders(
-        games, lineups_df, predictions, matchup_details,
-        umpires, bvp_annotations, pitcher_stats,
-        show_detail=show_detail,
-        pbp_sample_traces=pbp_sample_traces,
-    )
+    with tab_leaderboards:
+        render_leaderboards(
+            engine_mode=engine_mode,
+            batter_outcomes=batter_outcomes,
+            pitcher_outcomes=pitcher_outcomes,
+            lineups=lineups_df,
+            games=games,
+            pitcher_stats=pitcher_stats,
+        )
 
 
 if __name__ == "__main__":

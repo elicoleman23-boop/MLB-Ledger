@@ -73,6 +73,10 @@ class PipelineResultV2:
     # full PA trace (list of dicts from pa_engine.simulate_pa with each PA's
     # pitch_sequence) for UI inspection.
     pbp_sample_traces: dict = None  # type: ignore[assignment]
+    # Leaderboard data (pbp only): batter_id / pitcher_id → outcome-name →
+    # probability or mean. Empty dicts in fast mode.
+    batter_outcomes: dict = None  # type: ignore[assignment]
+    pitcher_outcomes: dict = None  # type: ignore[assignment]
 
 
 def run_daily_pipeline_v2(
@@ -257,6 +261,8 @@ def run_daily_pipeline_v2(
     # Simulate — fast PA-level or pitch-by-pitch depending on use_pbp
     _tick(progress, "simulate", 0.0)
     pbp_sample_traces: dict = {}
+    batter_outcomes: dict = {}
+    pitcher_outcomes: dict = {}
     if use_pbp:
         # Build pitch profiles. Batter profiles come from the Statcast
         # frames we already fetched; pitcher profiles likewise.
@@ -293,7 +299,7 @@ def run_daily_pipeline_v2(
             )
 
         effective_n_sims = n_sims if n_sims is not None else PBP_DEFAULT_N_SIMS
-        sim_results = simulate_pbp(
+        pbp_bundle = simulate_pbp(
             matchups,
             batter_pitch_profiles=batter_pitch_profiles,
             pitcher_pitch_profiles=pitcher_pitch_profiles,
@@ -302,6 +308,9 @@ def run_daily_pipeline_v2(
             n_sims=effective_n_sims,
             batter_park_mults=batter_park_mults,
         )
+        sim_results = pbp_bundle.batters
+        batter_outcomes = pbp_bundle.batter_outcomes
+        pitcher_outcomes = pbp_bundle.pitcher_outcomes
 
         # One sample trace per batter, for UI inspection. Cheap: a single
         # PA-per-matchup-slot walk per batter, not n_sims worth.
@@ -342,6 +351,8 @@ def run_daily_pipeline_v2(
         pitcher_stats=pitcher_stats_cache,
         summary={**summary, "n_matchups": len(matchups), "mode": "pbp" if use_pbp else "fast"},
         pbp_sample_traces=pbp_sample_traces,
+        batter_outcomes=batter_outcomes,
+        pitcher_outcomes=pitcher_outcomes,
     )
 
 

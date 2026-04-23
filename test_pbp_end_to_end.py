@@ -158,7 +158,7 @@ def main():
         # Pbp engine — lower n_sims, its own rng
         pbp_rng = np.random.default_rng(101)
         t0 = time.perf_counter()
-        pbp = simulate_pbp(
+        pbp_bundle = simulate_pbp(
             [mp],
             batter_pitch_profiles={12345: bp_pitch_profile},
             pitcher_pitch_profiles={67890: sp_pitch_profile},
@@ -166,8 +166,16 @@ def main():
             lineup_slots={12345: slot},
             n_sims=1_000,
             rng=pbp_rng,
-        )[0]
+        )
+        pbp = pbp_bundle.batters[0]
         elapsed = time.perf_counter() - t0
+
+        # Smoke-check the leaderboard-feeding outcome dicts are populated.
+        outcomes = pbp_bundle.batter_outcomes.get(12345, {})
+        for key in ("p_1_hit", "p_1_single", "p_1_walk", "p_1_k", "expected_k"):
+            assert key in outcomes, f"missing batter outcome {key!r}"
+        pitcher_out = pbp_bundle.pitcher_outcomes.get(67890, {})
+        assert "expected_k" in pitcher_out, "missing pitcher expected_k"
         total_pbp_elapsed += elapsed
 
         print(f"  fast  (sd=0): E[hits]={fast.expected_hits:.3f}  "
@@ -306,7 +314,7 @@ def main():
             # ump spread drives ~0.03-0.05 ΔE[hits] which is detectable.
             n_sims=10_000,
             rng=np.random.default_rng(77),
-        )[0]
+        ).batters[0]
         return r.expected_hits
 
     eh_hitter_ump = _pbp_with_ump(-0.04)   # max batter-friendly

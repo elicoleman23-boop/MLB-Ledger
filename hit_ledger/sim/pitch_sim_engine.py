@@ -15,7 +15,7 @@ but won't match engine_v2's throughput.
 """
 from __future__ import annotations
 
-from dataclasses import asdict
+from dataclasses import asdict, dataclass, field
 from typing import Any
 
 import numpy as np
@@ -29,6 +29,35 @@ from hit_ledger.config import UMPIRE_K_XBA_SENSITIVITY
 from hit_ledger.sim.engine_v2 import BatterSimResultV2
 from hit_ledger.sim.matchup_v2 import MatchupV2, PAProbability
 from hit_ledger.sim.pitch_sim import simulate_pa
+
+
+@dataclass
+class PbpSimResults:
+    """Rich return from simulate_pbp. `batters` keeps the BatterSimResultV2
+    shape the pipeline and fast-engine callers already consume; the two
+    outcome dicts expose the per-threshold and per-mean aggregates that
+    the leaderboards surface.
+
+    batter_outcomes[batter_id] holds keys like:
+        p_1_hit, p_2_hits, p_3_hits,
+        p_1_single, p_2_singles,
+        p_1_double,
+        p_1_triple,
+        p_1_hr, p_2_hr,
+        p_1_walk, p_2_walks,
+        p_1_k, p_2_k,
+        p_1_hbp,
+        p_tb_2, p_tb_3, p_tb_4,
+        expected_hits, expected_tb,
+        expected_k, expected_walks,
+        expected_singles, expected_doubles, expected_triples, expected_hr,
+
+    pitcher_outcomes[pitcher_id] holds:
+        expected_k   — starter K total averaged across sims
+    """
+    batters: list[BatterSimResultV2]
+    batter_outcomes: dict[int, dict[str, float]] = field(default_factory=dict)
+    pitcher_outcomes: dict[int, dict[str, float]] = field(default_factory=dict)
 
 
 def _pas_for_slot(slot: int | None) -> float:
@@ -85,10 +114,13 @@ def simulate_pbp(
     n_sims: int = 1_000,
     rng: np.random.Generator | None = None,
     batter_park_mults: dict[int, tuple[float, float]] | None = None,
-) -> list[BatterSimResultV2]:
+) -> PbpSimResults:
     """
-    Run the pitch-by-pitch Monte Carlo and return engine_v2-compatible
-    BatterSimResultV2 objects.
+    Run the pitch-by-pitch Monte Carlo. Returns a PbpSimResults struct:
+    `.batters` is the engine_v2-compatible BatterSimResultV2 list (so the
+    pipeline's downstream code is unchanged), while `.batter_outcomes`
+    and `.pitcher_outcomes` expose the wider set of threshold and mean
+    aggregates the leaderboards consume.
 
     Parameters
     ----------
@@ -118,6 +150,12 @@ def simulate_pbp(
     """
     rng = rng or np.random.default_rng(RNG_SEED)
     results: list[BatterSimResultV2] = []
+    batter_outcomes: dict[int, dict[str, float]] = {}
+
+    # Starter Ks aggregate across all batters facing the same pitcher.
+    # We allocate a counter per starter_id lazily the first time we see it,
+    # all sized (n_sims,) so they align at index-by-sim.
+    starter_k_per_sim: dict[int, np.ndarray] = {}
 
     for m in matchups:
         bp = batter_pitch_profiles.get(m.batter_id, {})
@@ -132,26 +170,31 @@ def simulate_pbp(
         floor_pa = int(np.floor(slot_pa))
         frac_pa = float(slot_pa - floor_pa)
 
-        # Precompute per-PA-slot pitcher profile lookup from the matchup's
-        # starter/bullpen source tags. PA indices beyond the length of
-        # pa_probs (possible when the Bernoulli fractional PA fires but
-        # matchup was built with a tight slot estimate) fall back to the
-        # bullpen profile, since extra PAs happen late in games.
         per_slot_is_starter: list[bool] = [
             pa.source.startswith("starter") for pa in m.pa_probs
         ]
         per_slot_context: list[dict] = _build_pa_contexts(m)
-        # Fallback context used for deep-extras PAs (beyond pa_probs length):
-        # treat as bullpen, use the ump_k_dev we already recovered, TTO=0.
         _fallback_context = {
             "tto": 0,
             "ump_k_dev": per_slot_context[0]["ump_k_dev"] if per_slot_context else 0.0,
             "is_bullpen": True,
         }
 
+        # Per-sim counters for every outcome we care about
         hits_per_sim = np.zeros(n_sims, dtype=np.int32)
         tb_per_sim = np.zeros(n_sims, dtype=np.int32)
-        hrs_per_sim = np.zeros(n_sims, dtype=np.int32)
+        singles_per_sim = np.zeros(n_sims, dtype=np.int32)
+        doubles_per_sim = np.zeros(n_sims, dtype=np.int32)
+        triples_per_sim = np.zeros(n_sims, dtype=np.int32)
+        hr_per_sim = np.zeros(n_sims, dtype=np.int32)
+        walks_per_sim = np.zeros(n_sims, dtype=np.int32)
+        ks_per_sim = np.zeros(n_sims, dtype=np.int32)
+        hbp_per_sim = np.zeros(n_sims, dtype=np.int32)
+
+        # Allocate starter K counter for this pitcher on first sighting
+        if m.starter_id not in starter_k_per_sim:
+            starter_k_per_sim[m.starter_id] = np.zeros(n_sims, dtype=np.int32)
+        starter_k_counter = starter_k_per_sim[m.starter_id]
 
         for sim in range(n_sims):
             n_pa = floor_pa + (1 if rng.random() < frac_pa else 0)
@@ -173,25 +216,88 @@ def simulate_pbp(
                     pa_context=ctx,
                 )
                 outcome = result["outcome"]
-                tb = _TB_BY_OUTCOME.get(outcome, 0)
-                if tb > 0:
-                    hits_per_sim[sim] += 1
-                    tb_per_sim[sim] += tb
-                    if outcome == "HR":
-                        hrs_per_sim[sim] += 1
 
+                # Hit-type counters
+                if outcome == "1B":
+                    singles_per_sim[sim] += 1
+                    hits_per_sim[sim] += 1
+                    tb_per_sim[sim] += 1
+                elif outcome == "2B":
+                    doubles_per_sim[sim] += 1
+                    hits_per_sim[sim] += 1
+                    tb_per_sim[sim] += 2
+                elif outcome == "3B":
+                    triples_per_sim[sim] += 1
+                    hits_per_sim[sim] += 1
+                    tb_per_sim[sim] += 3
+                elif outcome == "HR":
+                    hr_per_sim[sim] += 1
+                    hits_per_sim[sim] += 1
+                    tb_per_sim[sim] += 4
+                elif outcome == "BB":
+                    walks_per_sim[sim] += 1
+                elif outcome in ("K_swinging", "K_looking"):
+                    ks_per_sim[sim] += 1
+                    # Attribute the strikeout to whichever pitcher threw it
+                    if use_starter:
+                        starter_k_counter[sim] += 1
+                elif outcome == "HBP":
+                    hbp_per_sim[sim] += 1
+                # 'out' contributes nothing
+
+        # BatterSimResultV2 — unchanged shape, so the pipeline and cache
+        # layers keep working without code changes.
         results.append(BatterSimResultV2(
             batter_id=m.batter_id,
             p_1_hit=float((hits_per_sim >= 1).mean()),
             p_2_hits=float((hits_per_sim >= 2).mean()),
-            p_1_hr=float((hrs_per_sim >= 1).mean()),
+            p_1_hr=float((hr_per_sim >= 1).mean()),
             p_tb_over_1_5=float((tb_per_sim >= 2).mean()),
             p_tb_over_2_5=float((tb_per_sim >= 3).mean()),
             expected_hits=float(hits_per_sim.mean()),
             expected_tb=float(tb_per_sim.mean()),
         ))
 
-    return results
+        # Wider outcome dict — exactly what the leaderboards consume.
+        batter_outcomes[m.batter_id] = {
+            "p_1_hit":     float((hits_per_sim    >= 1).mean()),
+            "p_2_hits":    float((hits_per_sim    >= 2).mean()),
+            "p_3_hits":    float((hits_per_sim    >= 3).mean()),
+            "p_1_single":  float((singles_per_sim >= 1).mean()),
+            "p_2_singles": float((singles_per_sim >= 2).mean()),
+            "p_1_double":  float((doubles_per_sim >= 1).mean()),
+            "p_1_triple":  float((triples_per_sim >= 1).mean()),
+            "p_1_hr":      float((hr_per_sim      >= 1).mean()),
+            "p_2_hr":      float((hr_per_sim      >= 2).mean()),
+            "p_1_walk":    float((walks_per_sim   >= 1).mean()),
+            "p_2_walks":   float((walks_per_sim   >= 2).mean()),
+            "p_1_k":       float((ks_per_sim      >= 1).mean()),
+            "p_2_k":       float((ks_per_sim      >= 2).mean()),
+            "p_1_hbp":     float((hbp_per_sim     >= 1).mean()),
+            "p_tb_2":      float((tb_per_sim      >= 2).mean()),
+            "p_tb_3":      float((tb_per_sim      >= 3).mean()),
+            "p_tb_4":      float((tb_per_sim      >= 4).mean()),
+            "expected_hits":   float(hits_per_sim.mean()),
+            "expected_tb":     float(tb_per_sim.mean()),
+            "expected_singles": float(singles_per_sim.mean()),
+            "expected_doubles": float(doubles_per_sim.mean()),
+            "expected_triples": float(triples_per_sim.mean()),
+            "expected_hr":      float(hr_per_sim.mean()),
+            "expected_walks":   float(walks_per_sim.mean()),
+            "expected_k":       float(ks_per_sim.mean()),
+        }
+
+    # Pitcher outcomes — just E[K] for the starter for now.
+    pitcher_outcomes: dict[int, dict[str, float]] = {
+        pid: {"expected_k": float(counter.mean())}
+        for pid, counter in starter_k_per_sim.items()
+    }
+
+    return PbpSimResults(
+        batters=results,
+        batter_outcomes=batter_outcomes,
+        pitcher_outcomes=pitcher_outcomes,
+    )
 
 
 def sample_one_trace(
