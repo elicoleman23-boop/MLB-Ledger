@@ -144,6 +144,22 @@ def main():
         print(f"TTO penalties: {mp.tto_penalties}")
         print(f"Umpire xBA adj: {mp.umpire_adjustment:+.4f}")
         print(f"Bullpen xBA used: {mp.bullpen_xba:.3f}")
+
+        # Before/after: old (biased) E[contact]·E[xBA] vs new (correct) E[contact·xBA]
+        # Both are pre-park, pre-TTO, pre-ump — shows the pure covariance correction.
+        if mp.starter_breakdown:
+            share_sum = sum(b["share"] for b in mp.starter_breakdown)
+            if share_sum > 0:
+                w_contact = sum(b["share"] * b["batter_contact"] for b in mp.starter_breakdown) / share_sum
+                w_xba = sum(b["share"] * b["batter_xba"] for b in mp.starter_breakdown) / share_sum
+                w_composite = sum(b["share"] * b["batter_contact"] * b["batter_xba"] for b in mp.starter_breakdown) / share_sum
+                naive_p_hit = w_contact * w_xba
+                delta = w_composite - naive_p_hit
+                print(
+                    f"Starter p_hit (pre-park): "
+                    f"old={naive_p_hit:.4f}  new={w_composite:.4f}  Δ={delta:+.4f}"
+                )
+
         print(f"\nPer-PA probabilities:")
         for i, pa in enumerate(mp.pa_probs, 1):
             print(f"  PA {i}: {pa.source:18s} P(hit)={pa.p_hit:.3f}  "

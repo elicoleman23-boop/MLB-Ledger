@@ -215,7 +215,7 @@ def _compute_starter_matchup(
     pitcher_throws: str,
     pitcher_arsenal: dict[str, float],
     as_of: date,
-) -> tuple[float, float, list[dict], str]:
+) -> tuple[float, float, float, list[dict], str]:
     """
     Compute weighted xBA on contact AND contact rate across pitch types.
 
@@ -227,7 +227,15 @@ def _compute_starter_matchup(
     P(hit per PA) = P(contact) × P(hit | contact)
                   = contact_rate × xba_on_contact
 
-    Returns (xba_on_contact, contact_rate, breakdown, overall_data_quality).
+    IMPORTANT: contact rate and xBA on contact covary across pitch types
+    (fastballs tend to be high-contact AND high-xBA; sliders are low-contact
+    AND low-xBA). So E[contact] · E[xBA] ≠ E[contact · xBA]. The weighted
+    composite p_hit, `weighted_p_hit_on_contact = Σ (share_i · contact_i · xba_i)`,
+    is the mathematically correct per-PA hit probability and should be
+    preferred over `weighted_contact × weighted_xba` downstream.
+
+    Returns (weighted_xba, weighted_contact, weighted_p_hit_on_contact,
+             breakdown, overall_data_quality).
     """
     if not pitcher_arsenal:
         pitcher_arsenal = {"FF": 0.55, "SL": 0.25, "CH": 0.20}
@@ -241,6 +249,7 @@ def _compute_starter_matchup(
     breakdown = []
     weighted_xba = 0.0
     weighted_contact = 0.0
+    weighted_p_hit_on_contact = 0.0
     total_share = 0.0
 
     for pitch_type, share in pitcher_arsenal.items():
@@ -294,6 +303,9 @@ def _compute_starter_matchup(
 
         weighted_xba += share * adjusted_xba
         weighted_contact += share * adjusted_contact
+        # Mathematically correct composite: weight per-pitch p_hit, don't
+        # multiply two independently-weighted averages (they covary).
+        weighted_p_hit_on_contact += share * adjusted_contact * adjusted_xba
         total_share += share
 
         # Calculate the ACTUAL hit probability for this pitch type
@@ -323,6 +335,7 @@ def _compute_starter_matchup(
     if total_share > 0:
         weighted_xba /= total_share
         weighted_contact /= total_share
+        weighted_p_hit_on_contact /= total_share
 
     if breakdown:
         q_sum = sum(DATA_QUALITY_SCORE[b["data_quality"]] * b["share"] for b in breakdown)
@@ -334,7 +347,7 @@ def _compute_starter_matchup(
     else:
         overall_quality = "no_data"
 
-    return weighted_xba, weighted_contact, breakdown, overall_quality
+    return weighted_xba, weighted_contact, weighted_p_hit_on_contact, breakdown, overall_quality
 
 
 def _compute_starter_xba(
@@ -344,7 +357,7 @@ def _compute_starter_xba(
     as_of: date,
 ) -> tuple[float, list[dict]]:
     """Legacy wrapper - returns xBA only for backward compatibility."""
-    xba, _, breakdown, _ = _compute_starter_matchup(
+    xba, _, _, breakdown, _ = _compute_starter_matchup(
         batter_df, pitcher_throws, pitcher_arsenal, as_of
     )
     return xba, breakdown
@@ -401,8 +414,14 @@ def build_matchup_v2(
     """
     as_of = as_of or date.today()
 
-    # Step 1: starter matchup (xBA AND contact rate, both pitch-mix weighted)
-    starter_xba_base, starter_contact_base, starter_breakdown, overall_data_quality = _compute_starter_matchup(
+    # Step 1: starter matchup (xBA, contact rate, and composite p_hit, all pitch-mix weighted)
+    (
+        starter_xba_base,
+        starter_contact_base,
+        starter_p_hit_on_contact_base,
+        starter_breakdown,
+        overall_data_quality,
+    ) = _compute_starter_matchup(
         batter_df, starter_throws, starter_arsenal, as_of
     )
 
@@ -445,16 +464,14 @@ def build_matchup_v2(
         tto_num = min(pa_idx + 1, 3)
         penalty = tto_penalties[tto_num]
 
-        # Apply TTO penalty to xBA (pitcher gets worse as TTO increases)
-        xba = starter_xba_base + penalty + ump_xba_adj
-        xba = xba * park_mult_hits
+        # TTO penalty and umpire adjustment are expressed in xBA-space.
+        # Convert to p_hit-space by multiplying by contact rate, then compose
+        # with the pitch-mix-weighted p_hit and apply the park multiplier.
+        penalty_adj = penalty * starter_contact_base
+        ump_adj = ump_xba_adj * starter_contact_base
 
-        # Use batter's ACTUAL contact rate (no arbitrary adjustments)
-        contact = starter_contact_base
-        contact = float(np.clip(contact, 0.40, 0.95))
-
-        # P(hit per PA) = contact × xBA - purely from batter's data
-        p_hit = contact * xba
+        p_hit = starter_p_hit_on_contact_base + penalty_adj + ump_adj
+        p_hit = p_hit * park_mult_hits
         p_hit = float(np.clip(p_hit, 0.0, 0.42))
 
         p_hr = float(np.clip(p_hr_raw * park_mult_hr, 0.0, 0.08))
@@ -501,7 +518,10 @@ def build_matchup_v2(
         contact = float(np.clip(bullpen_contact, 0.40, 0.95))
         xba = (bullpen_xba_base + ump_xba_adj) * park_mult_hits
 
-        # P(hit per PA) = contact × xBA
+        # Bullpen xBA here is a team-level aggregate (already a composite rate,
+        # not pitch-type decomposed), so the E[X]·E[Y] ≠ E[X·Y] correction
+        # doesn't apply — contact × xba is fine here. Fix pending for when
+        # bullpen data gets pitch-type splits.
         p_hit = contact * xba
         p_hit = float(np.clip(p_hit, 0.0, 0.42))
 
