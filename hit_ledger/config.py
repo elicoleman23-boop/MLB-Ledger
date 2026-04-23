@@ -57,6 +57,13 @@ DEFAULT_PA = 4.2  # fallback if lineup slot unknown
 N_SIMULATIONS = 10_000
 RNG_SEED = None  # set an int for reproducibility during debugging
 
+# Standard deviation of BABIP luck per PA. Balls in play have inherent
+# variance beyond contact quality (fielder positioning, weather, random
+# bounces). This adds a normally-distributed multiplicative noise to the
+# non-HR hit probability per PA in the sampling engine. Set to 0 for
+# deterministic runs.
+BABIP_NOISE_SD = 0.08  # 8% relative noise on non-HR hit prob
+
 # ---------------------------------------------------------------------------
 # League-average priors (used for shrinkage)
 # Sourced from Baseball Savant 2024 league-wide splits; refresh annually.

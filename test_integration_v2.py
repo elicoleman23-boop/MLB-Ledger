@@ -259,6 +259,79 @@ def main():
         print(f"  E[hits]     = {r.expected_hits:.2f}")
         print(f"  E[TB]       = {r.expected_tb:.2f}")
 
+    # ------------------------------------------------------------------
+    # BABIP noise validation (Fix D)
+    # ------------------------------------------------------------------
+    print("\n" + "=" * 70)
+    print("BABIP noise validation")
+    print("=" * 70)
+
+    val_scen = scenarios[0]
+    val_mp = build_matchup_v2(
+        batter_id=12345,
+        batter_df=batter_df,
+        starter_id=67890,
+        starter_throws="R",
+        starter_arsenal=arsenal,
+        starter_workload=val_scen["starter_workload"],
+        tto_splits=val_scen["tto_splits"],
+        bullpen_profile=val_scen["bullpen_profile"],
+        batter_stands="R",
+        lineup_slot=slot,
+        total_pa=total_pa,
+        venue=val_scen["venue"],
+        umpire_k_dev=val_scen["umpire_k_dev"],
+        as_of=date(2025, 6, 15),
+        pitcher_df=pitcher_df,
+    )
+
+    def _run(sd: float, seed: int = 42):
+        return simulate_v2(
+            [val_mp], {12345: slot}, n_sims=10_000,
+            rng=np.random.default_rng(seed),
+            babip_noise_sd=sd,
+        )[0]
+
+    r_zero_a = _run(0.0)
+    r_zero_b = _run(0.0)
+    r_noise = _run(0.08)
+
+    print(
+        f"sd=0.0  (seed 42, run A): E[hits]={r_zero_a.expected_hits:.4f}  "
+        f"P(1+)={r_zero_a.p_1_hit:.4f}  P(2+)={r_zero_a.p_2_hits:.4f}"
+    )
+    print(
+        f"sd=0.0  (seed 42, run B): E[hits]={r_zero_b.expected_hits:.4f}  "
+        f"P(1+)={r_zero_b.p_1_hit:.4f}  P(2+)={r_zero_b.p_2_hits:.4f}"
+    )
+    print(
+        f"sd=0.08 (seed 42       ): E[hits]={r_noise.expected_hits:.4f}  "
+        f"P(1+)={r_noise.p_1_hit:.4f}  P(2+)={r_noise.p_2_hits:.4f}"
+    )
+
+    # Assertions
+    assert r_zero_a.expected_hits == r_zero_b.expected_hits, "sd=0 not deterministic"
+    assert r_zero_a.p_1_hit == r_zero_b.p_1_hit, "sd=0 not deterministic"
+    assert r_zero_a.p_2_hits == r_zero_b.p_2_hits, "sd=0 not deterministic"
+    assert abs(r_noise.expected_hits - r_zero_a.expected_hits) < 0.02, (
+        f"E[hits] moved too far with noise: "
+        f"{r_zero_a.expected_hits:.4f} → {r_noise.expected_hits:.4f}"
+    )
+    assert r_noise.p_2_hits > r_zero_a.p_2_hits, (
+        f"P(2+ hits) should INCREASE with BABIP noise "
+        f"({r_zero_a.p_2_hits:.4f} → {r_noise.p_2_hits:.4f})"
+    )
+
+    print(
+        f"\nΔ E[hits] (noise vs deterministic) = "
+        f"{r_noise.expected_hits - r_zero_a.expected_hits:+.4f}"
+    )
+    print(
+        f"Δ P(2+ hits) (noise vs deterministic) = "
+        f"{r_noise.p_2_hits - r_zero_a.p_2_hits:+.4f}"
+    )
+    print("BABIP noise validation: OK")
+
 
 if __name__ == "__main__":
     main()

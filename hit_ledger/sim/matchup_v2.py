@@ -104,13 +104,17 @@ def _xba_and_contact_for_split(
     since: date | None = None,
 ) -> tuple[float, float, int]:
     """
-    Compute both xBA on contact AND contact rate for a (pitch_type, p_throws) split.
+    Compute both contact quality AND contact rate for a (pitch_type, p_throws) split.
 
     Returns:
-        (xba_on_contact, contact_rate, n_pitches)
+        (contact_quality, contact_rate, n_pitches)
 
-    contact_rate = (PAs with ball in play) / (total PAs)
-    xba_on_contact = expected BA when ball is put in play
+    contact_rate  = (PAs with ball in play) / (total PAs)
+    contact_quality = xwOBAcon-flavored skill metric: expected BA on contact,
+                      derived from Statcast's estimated_ba_using_speedangle.
+                      Measures how well the batter squared it up — a stable
+                      skill signal, separate from BABIP luck (which is
+                      injected in the sampling engine).
     """
     league_xba = LEAGUE_XBA_BY_PITCH.get(pitch_type, LEAGUE_AVG_XBA)
     league_whiff = LEAGUE_WHIFF_BY_PITCH.get(pitch_type, 0.25)
@@ -150,19 +154,19 @@ def _xba_and_contact_for_split(
     else:
         contact_rate = league_contact
 
-    # xBA on contact (only for balls in play)
+    # Contact quality (expected BA on balls in play only)
     ball_in_play = pa_ending[~pa_ending["events"].isin(strikeout_events | walk_events)]
     if ball_in_play.empty:
-        xba_on_contact = league_xba
+        contact_quality = league_xba
     else:
         xba_series = ball_in_play["estimated_ba_using_speedangle"].copy()
         hit_events = {"single", "double", "triple", "home_run"}
         for idx in xba_series[xba_series.isna()].index:
             ev = ball_in_play.at[idx, "events"]
             xba_series.at[idx] = 1.0 if ev in hit_events else 0.0
-        xba_on_contact = float(xba_series.mean())
+        contact_quality = float(xba_series.mean())
 
-    return xba_on_contact, contact_rate, n
+    return contact_quality, contact_rate, n
 
 
 def _xba_for_split(
@@ -198,7 +202,7 @@ def _pitcher_rates_for_pitch(
     batter_stands: str,
 ) -> tuple[float, float, int]:
     """
-    Returns (pitcher_xba_on_contact, pitcher_contact_rate, n_pitches) for
+    Returns (pitcher_contact_quality, pitcher_contact_rate, n_pitches) for
     this pitcher's specific pitch type vs batters of `batter_stands`.
 
     Mirrors _xba_and_contact_for_split but computed from the pitcher's POV.
@@ -236,16 +240,16 @@ def _pitcher_rates_for_pitch(
 
     ball_in_play = pa_ending[~pa_ending["events"].isin(strikeout_events | walk_events)]
     if ball_in_play.empty:
-        xba_on_contact = league_xba
+        contact_quality = league_xba
     else:
         xba_series = ball_in_play["estimated_ba_using_speedangle"].copy()
         hit_events = {"single", "double", "triple", "home_run"}
         for idx in xba_series[xba_series.isna()].index:
             ev = ball_in_play.at[idx, "events"]
             xba_series.at[idx] = 1.0 if ev in hit_events else 0.0
-        xba_on_contact = float(xba_series.mean())
+        contact_quality = float(xba_series.mean())
 
-    return xba_on_contact, contact_rate, n
+    return contact_quality, contact_rate, n
 
 
 _NON_CONTACT_EVENTS = {
@@ -364,7 +368,7 @@ def _compute_starter_matchup(
     - Log-5 combines them against the league baseline for that pitch type.
 
     P(hit per PA) = P(contact) × P(hit | contact)
-                  = contact_rate × xba_on_contact
+                  = contact_rate × contact_quality
 
     IMPORTANT: contact rate and xBA on contact covary across pitch types
     (fastballs tend to be high-contact AND high-xBA; sliders are low-contact
@@ -614,9 +618,12 @@ def build_matchup_v2(
 
     CRITICAL: Hit probability per PA is calculated as:
         P(hit) = P(contact) × P(hit | contact)
-               = contact_rate × xba_on_contact
+               = contact_rate × contact_quality
 
     This is much lower than raw xBA (~0.16-0.20 per PA, not 0.24-0.28).
+    (BABIP luck — variance between expected and actual outcomes on balls
+    in play — is injected separately in the sampling engine, so downstream
+    P(hit) here is purely the contact-quality skill signal.)
 
     Algorithm:
         1. Compute starter xBA AND contact rate via pitch-mix weighting

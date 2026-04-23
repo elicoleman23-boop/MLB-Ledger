@@ -18,6 +18,7 @@ import numpy as np
 import pandas as pd
 
 from hit_ledger.config import (
+    BABIP_NOISE_SD,
     DEFAULT_PA,
     N_SIMULATIONS,
     PA_BY_LINEUP_SLOT,
@@ -54,6 +55,7 @@ def simulate_v2(
     lineup_slots: dict[int, int],
     n_sims: int = N_SIMULATIONS,
     rng: np.random.Generator | None = None,
+    babip_noise_sd: float = BABIP_NOISE_SD,
 ) -> list[BatterSimResultV2]:
     """
     Run the Monte Carlo using per-PA probabilities.
@@ -62,6 +64,15 @@ def simulate_v2(
     the ordered sequence of PAs. The length of that list is the maximum
     possible PAs; the actual count per sim is drawn from the lineup-slot
     PA distribution (e.g., 4.3 PAs = 4 guaranteed + 30% of a 5th).
+
+    BABIP noise: when `babip_noise_sd > 0`, a normally-distributed
+    multiplicative factor ~ N(1, babip_noise_sd), clipped to [0.5, 1.5],
+    is applied to the 1B/2B/3B probabilities independently per (batter,
+    sim, PA). HR probability is left unchanged — HRs are not BABIP.
+    The noise is centered at 1.0 so expected means are preserved; only
+    variance/dispersion grows (fatter P(≥2 hits) tails). Setting
+    `babip_noise_sd=0` short-circuits to the deterministic path and
+    reproduces pre-noise results bit-for-bit.
     """
     if not matchups:
         return []
@@ -112,19 +123,45 @@ def simulate_v2(
     # Total simulated PA slots per batter cap at max_pa_len
     sim_max_pa = min(max_pa_len, int(floor_pa.max()) + 1)
 
-    # Cumulative probs per (batter, pa_slot): shape (n_batters, sim_max_pa, 5)
-    cum_probs = np.cumsum(probs[:, :sim_max_pa, :], axis=2)
-    cum_probs[:, :, -1] = 1.0
-
     # Draw uniforms for every (batter, sim, pa): (n_batters, n_sims, sim_max_pa)
     uniforms = rng.random((n_batters, n_sims, sim_max_pa))
 
-    # Inverse-CDF lookup per (batter, pa_slot) — each slot has its own dist
     outcomes = np.empty((n_batters, n_sims, sim_max_pa), dtype=np.int8)
-    for i in range(n_batters):
-        for j in range(sim_max_pa):
-            # cum_probs[i, j] is the CDF for batter i's j-th PA
-            outcomes[i, :, j] = np.searchsorted(cum_probs[i, j], uniforms[i, :, j])
+
+    if babip_noise_sd <= 0:
+        # Deterministic path — shared CDF across sims per (batter, PA slot).
+        # Bit-for-bit identical to the pre-BABIP-noise engine.
+        cum_probs = np.cumsum(probs[:, :sim_max_pa, :], axis=2)
+        cum_probs[:, :, -1] = 1.0
+        for i in range(n_batters):
+            for j in range(sim_max_pa):
+                outcomes[i, :, j] = np.searchsorted(cum_probs[i, j], uniforms[i, :, j])
+    else:
+        # BABIP noise path — per (batter, sim, PA) perturbation of 1B/2B/3B
+        # probabilities. HR is left untouched. Loop over batters to keep
+        # peak memory modest; each iteration allocates (n_sims, sim_max_pa, 5).
+        static_probs = probs[:, :sim_max_pa, :]  # (n_batters, sim_max_pa, 5)
+        for i in range(n_batters):
+            noise = rng.normal(
+                loc=1.0, scale=babip_noise_sd, size=(n_sims, sim_max_pa)
+            )
+            np.clip(noise, 0.5, 1.5, out=noise)
+            # Broadcast batter i's per-PA-slot probs across all sims
+            noisy_i = np.broadcast_to(
+                static_probs[i][None, :, :], (n_sims, sim_max_pa, 5)
+            ).copy()
+            # Scale 1B/2B/3B slots by per-(sim, PA) noise; HR (slot 4) unchanged
+            noise_3d = noise[:, :, None]  # (n_sims, sim_max_pa, 1)
+            noisy_i[:, :, 1:4] *= noise_3d
+            # Recompute out prob = 1 - (hits + HR), clip total hit prob
+            total_hit = noisy_i[:, :, 1:].sum(axis=2)
+            np.clip(total_hit, 0.0, 0.95, out=total_hit)
+            noisy_i[:, :, 0] = 1.0 - total_hit
+            # Cumulative + inverse-CDF, fully vectorized across (sim, PA)
+            cum_i = np.cumsum(noisy_i, axis=2)
+            cum_i[:, :, -1] = 1.0
+            u_i = uniforms[i, :, :, None]  # (n_sims, sim_max_pa, 1)
+            outcomes[i] = (u_i > cum_i).sum(axis=-1).astype(np.int8)
 
     # PA-existence mask (same logic as v1)
     pa_idx = np.arange(sim_max_pa).reshape(1, 1, sim_max_pa)
