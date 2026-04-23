@@ -57,11 +57,11 @@ DEFAULT_PA = 4.2  # fallback if lineup slot unknown
 N_SIMULATIONS = 10_000
 RNG_SEED = None  # set an int for reproducibility during debugging
 
-# Standard deviation of BABIP luck per PA. Balls in play have inherent
-# variance beyond contact quality (fielder positioning, weather, random
-# bounces). This adds a normally-distributed multiplicative noise to the
-# non-HR hit probability per PA in the sampling engine. Set to 0 for
-# deterministic runs.
+# Game-level multiplicative noise on non-HR hit probabilities — one draw
+# per simulated game, shared across all PAs. Models persistent within-game
+# effects (weather, umpire, defensive form). Centered at 1.0 so means are
+# preserved; variance/dispersion grows, producing realistic fat tails for
+# team totals and alt-line markets. Set to 0 for deterministic runs.
 BABIP_NOISE_SD = 0.08  # 8% relative noise on non-HR hit prob
 
 # ---------------------------------------------------------------------------

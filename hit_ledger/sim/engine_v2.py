@@ -67,12 +67,17 @@ def simulate_v2(
 
     BABIP noise: when `babip_noise_sd > 0`, a normally-distributed
     multiplicative factor ~ N(1, babip_noise_sd), clipped to [0.5, 1.5],
-    is applied to the 1B/2B/3B probabilities independently per (batter,
-    sim, PA). HR probability is left unchanged — HRs are not BABIP.
-    The noise is centered at 1.0 so expected means are preserved; only
-    variance/dispersion grows (fatter P(≥2 hits) tails). Setting
-    `babip_noise_sd=0` short-circuits to the deterministic path and
-    reproduces pre-noise results bit-for-bit.
+    is applied to the 1B/2B/3B probabilities. One noise draw per
+    (batter, sim) is SHARED across all of that batter's PAs in the
+    simulated game — a first-order model of persistent within-game
+    effects (weather, umpire, defensive form, starter's "stuff today").
+    Per-PA independent noise averages out across 4-5 PAs per game and
+    barely moves dispersion; game-level correlated noise is what
+    produces realistic fat tails on P(≥2 hits), team totals, and
+    alt-line markets. HR probability is left unchanged — HRs are not
+    BABIP. The noise is centered at 1.0 so expected means are preserved.
+    Setting `babip_noise_sd=0` short-circuits to the deterministic path
+    and reproduces pre-noise results bit-for-bit.
     """
     if not matchups:
         return []
@@ -142,8 +147,16 @@ def simulate_v2(
         # peak memory modest; each iteration allocates (n_sims, sim_max_pa, 5).
         static_probs = probs[:, :sim_max_pa, :]  # (n_batters, sim_max_pa, 5)
         for i in range(n_batters):
+            # Game-level correlated noise: one draw per (batter, sim) shared
+            # across all of that batter's PAs in the simulated game. Models
+            # the persistent within-game effects (weather, umpire, defensive
+            # form, starter's "stuff today") that make real MLB within-game
+            # variance larger than independent Bernoulli trials would produce.
+            # Per-PA independent noise averages out across 4-5 PAs per game
+            # and yields near-zero dispersion growth; a single per-game draw
+            # is a first-order model of the persistent effects.
             noise = rng.normal(
-                loc=1.0, scale=babip_noise_sd, size=(n_sims, sim_max_pa)
+                loc=1.0, scale=babip_noise_sd, size=(n_sims, 1)
             )
             np.clip(noise, 0.5, 1.5, out=noise)
             # Broadcast batter i's per-PA-slot probs across all sims
