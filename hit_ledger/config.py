@@ -115,40 +115,50 @@ MIN_EV_LA_SAMPLE = 40
 
 # League-wide batted-ball distribution (all pitch types pooled). Used as the
 # ultimate fallback when per-pitch and overall samples are both too sparse.
+# Calibrated to 2024 MLB league averages. Refresh annually or when adding a
+# pybaseball-based calibration harness (Gap-2 follow-up).
 LEAGUE_EV_LA = {
-    "mean_ev": 88.5,   # mph
-    "sd_ev": 13.5,
-    "mean_la": 12.0,   # degrees
-    "sd_la": 27.0,
-    "corr_ev_la": -0.05,
+    "mean_ev": 89.1,   # mph
+    "sd_ev": 14.8,
+    "mean_la": 11.5,   # degrees
+    "sd_la": 28.2,
+    "corr_ev_la": -0.08,
 }
 
-# P(swing | in-zone) per pitch type
+# P(swing | in-zone) per pitch type.
+# Calibrated to 2024 MLB league averages. Refresh annually or when adding a
+# pybaseball-based calibration harness (Gap-2 follow-up).
 LEAGUE_Z_SWING_BY_PITCH = {
-    "FF": 0.72, "SI": 0.75, "FC": 0.70, "SL": 0.63, "ST": 0.60,
-    "CU": 0.58, "KC": 0.60, "CH": 0.66, "FS": 0.64, "FO": 0.58,
-    "SC": 0.62, "EP": 0.55,
+    "FF": 0.69, "SI": 0.73, "FC": 0.68, "SL": 0.62, "ST": 0.60,
+    "CU": 0.55, "KC": 0.58, "CH": 0.64, "FS": 0.62, "FO": 0.56,
+    "SC": 0.60, "EP": 0.52,
 }
 
-# P(swing | out-of-zone) per pitch type
+# P(swing | out-of-zone) per pitch type.
+# Calibrated to 2024 MLB league averages. Refresh annually or when adding a
+# pybaseball-based calibration harness (Gap-2 follow-up).
 LEAGUE_O_SWING_BY_PITCH = {
-    "FF": 0.22, "SI": 0.26, "FC": 0.28, "SL": 0.36, "ST": 0.38,
-    "CU": 0.28, "KC": 0.30, "CH": 0.34, "FS": 0.38, "FO": 0.34,
-    "SC": 0.30, "EP": 0.15,
+    "FF": 0.18, "SI": 0.23, "FC": 0.26, "SL": 0.33, "ST": 0.31,
+    "CU": 0.25, "KC": 0.27, "CH": 0.31, "FS": 0.35, "FO": 0.31,
+    "SC": 0.27, "EP": 0.12,
 }
 
-# P(contact | swing, in-zone) per pitch type
+# P(contact | swing, in-zone) per pitch type.
+# Calibrated to 2024 MLB league averages. Refresh annually or when adding a
+# pybaseball-based calibration harness (Gap-2 follow-up).
 LEAGUE_Z_CONTACT_BY_PITCH = {
-    "FF": 0.88, "SI": 0.90, "FC": 0.85, "SL": 0.78, "ST": 0.75,
-    "CU": 0.82, "KC": 0.80, "CH": 0.82, "FS": 0.78, "FO": 0.78,
-    "SC": 0.82, "EP": 0.85,
+    "FF": 0.89, "SI": 0.91, "FC": 0.86, "SL": 0.80, "ST": 0.77,
+    "CU": 0.83, "KC": 0.81, "CH": 0.83, "FS": 0.79, "FO": 0.79,
+    "SC": 0.83, "EP": 0.87,
 }
 
-# P(contact | swing, out-of-zone) per pitch type
+# P(contact | swing, out-of-zone) per pitch type.
+# Calibrated to 2024 MLB league averages. Refresh annually or when adding a
+# pybaseball-based calibration harness (Gap-2 follow-up).
 LEAGUE_O_CONTACT_BY_PITCH = {
-    "FF": 0.70, "SI": 0.72, "FC": 0.65, "SL": 0.52, "ST": 0.48,
-    "CU": 0.60, "KC": 0.58, "CH": 0.62, "FS": 0.55, "FO": 0.55,
-    "SC": 0.60, "EP": 0.65,
+    "FF": 0.64, "SI": 0.66, "FC": 0.58, "SL": 0.48, "ST": 0.43,
+    "CU": 0.55, "KC": 0.52, "CH": 0.56, "FS": 0.50, "FO": 0.49,
+    "SC": 0.55, "EP": 0.60,
 }
 
 # Per-pitch-type league averages for xBA AND whiff rates
