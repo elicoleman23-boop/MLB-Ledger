@@ -108,6 +108,17 @@ CREATE TABLE IF NOT EXISTS bullpen_profiles (
     PRIMARY KEY (game_date, team)
 );
 
+-- Fix F: per-team bullpen rosters with workload + leverage metadata.
+-- Stored as a JSON list of reliever dicts because the schema varies
+-- (recent_ip, LI, back_to_back, etc.) and the list is short.
+CREATE TABLE IF NOT EXISTS team_bullpen_roster (
+    game_date    TEXT NOT NULL,
+    team         TEXT NOT NULL,
+    roster_json  TEXT NOT NULL,
+    fetched_at   TEXT NOT NULL,
+    PRIMARY KEY (game_date, team)
+);
+
 -- Starter workload: avg IP/start in recent window
 CREATE TABLE IF NOT EXISTS starter_workload (
     game_date        TEXT NOT NULL,
@@ -417,6 +428,39 @@ def load_bullpen_profile(game_date: date, team: str) -> dict | None:
             (game_date.isoformat(), team),
         ).fetchone()
     return dict(row) if row else None
+
+
+# ---------------------------------------------------------------------------
+# Fix F: team bullpen rosters
+# ---------------------------------------------------------------------------
+def save_team_bullpen_roster(
+    game_date: date,
+    team: str,
+    roster: list[dict[str, Any]],
+) -> None:
+    with _connect() as conn:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO team_bullpen_roster
+            (game_date, team, roster_json, fetched_at)
+            VALUES (?, ?, ?, datetime('now'))
+            """,
+            (game_date.isoformat(), team, json.dumps(roster)),
+        )
+
+
+def load_team_bullpen_roster(
+    game_date: date, team: str
+) -> list[dict[str, Any]] | None:
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT roster_json FROM team_bullpen_roster "
+            "WHERE game_date = ? AND team = ?",
+            (game_date.isoformat(), team),
+        ).fetchone()
+    if row is None:
+        return None
+    return json.loads(row["roster_json"])
 
 
 # ---------------------------------------------------------------------------

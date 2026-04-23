@@ -293,6 +293,16 @@ LEAGUE_AVG_BULLPEN_XBA_VS_R = 0.243
 LEAGUE_AVG_BULLPEN_XBA_VS_L = 0.248
 BULLPEN_REGRESSION_K = 250              # PA threshold for bullpen regression
 
+# Fix F: per-reliever bullpen modeling. When True, the pipeline fetches
+# per-team rosters, computes usage probabilities per PA (inning + handedness
+# + rest heuristic), and log-5 blends each reliever individually with the
+# usage-probability weight. When False, falls back to the team-level
+# bullpen xBA aggregate that predates Fix F. Defaults False — the data
+# layer (StatsAPI roster, pybaseball workload) hits the network hard on
+# cold caches, so the opt-in model avoids surprising slate-load slowdowns
+# for users who haven't pre-warmed their cache.
+USE_PER_RELIEVER_BULLPEN = False
+
 # ---------------------------------------------------------------------------
 # Times Through the Order (TTO)
 # ---------------------------------------------------------------------------

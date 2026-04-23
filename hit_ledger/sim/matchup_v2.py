@@ -51,6 +51,7 @@ from hit_ledger.data.pitcher_workload import (
     expected_pa_vs_starter,
     tto_penalty_to_apply,
 )
+from hit_ledger.data.relievers import predict_reliever_usage_probs
 
 
 # ---------------------------------------------------------------------------
@@ -350,17 +351,22 @@ def _batter_overall_contact_rate(batter_df: pd.DataFrame) -> tuple[float, int]:
     return _regress(raw, n_pa, LEAGUE_AVG_CONTACT_RATE, k=REGRESSION_K_CONTACT), n_pa
 
 
-def _compute_starter_matchup(
+def _compute_pitcher_matchup(
     batter_df: pd.DataFrame,
     pitcher_throws: str,
     pitcher_arsenal: dict[str, float],
     as_of: date,
     pitcher_df: pd.DataFrame | None = None,
     batter_stands: str = "R",
-) -> tuple[float, float, float, list[dict], str]:
+) -> tuple[float, float, float, float, list[dict], str]:
     """
     Compute weighted xBA on contact AND contact rate across pitch types,
     blending batter and pitcher per-pitch-type rates via log-5.
+
+    Used for both starters (full TTO sequence in build_matchup_v2) and
+    individual relievers (single-TTO bullpen PAs). The logic is identical
+    — pitch-mix weighted log-5 against league priors — so both roles
+    share this helper. Fix F adds the reliever call site.
 
     BATTER SPLITS ARE ONE SIDE OF THE EDGE:
     - Batter's performance vs (pitch_type, p_throws) sets their half.
@@ -572,7 +578,7 @@ def _compute_starter_xba(
     as_of: date,
 ) -> tuple[float, list[dict]]:
     """Legacy wrapper - returns xBA only for backward compatibility."""
-    xba, _, _, _, breakdown, _ = _compute_starter_matchup(
+    xba, _, _, _, breakdown, _ = _compute_pitcher_matchup(
         batter_df, pitcher_throws, pitcher_arsenal, as_of
     )
     return xba, breakdown
@@ -588,6 +594,141 @@ def _split_xba_into_components(
     p_2b = non_hr_hit * HIT_TYPE_DIST["2B"] / denom
     p_3b = non_hr_hit * HIT_TYPE_DIST["3B"] / denom
     return p_1b, p_2b, p_3b
+
+
+# ---------------------------------------------------------------------------
+# Per-reliever bullpen helpers (Fix F)
+# ---------------------------------------------------------------------------
+def _precompute_reliever_matchups(
+    batter_df: pd.DataFrame,
+    bullpen_roster: list[dict],
+    reliever_arsenals: dict[int, dict],
+    reliever_profiles: dict,
+    batter_stands: str,
+    as_of: date,
+) -> dict[int, dict[str, float]]:
+    """For each reliever in the roster, run the same pitch-mix log-5
+    computation the starter uses and cache the four scalars the bullpen
+    PA loop needs. Called once per batter — cheaper than redoing log-5
+    on every bullpen PA × reliever combo."""
+    matchups: dict[int, dict[str, float]] = {}
+    for entry in bullpen_roster:
+        pid = entry.get("player_id")
+        if pid is None:
+            continue
+        arsenal = reliever_arsenals.get(pid)
+        if not arsenal:
+            continue
+        pitcher_df = reliever_profiles.get(pid)
+        throws = entry.get("throws") or "R"
+        wx, wc, wphc, whrpc, _, _ = _compute_pitcher_matchup(
+            batter_df, throws, arsenal, as_of,
+            pitcher_df=pitcher_df, batter_stands=batter_stands,
+        )
+        matchups[int(pid)] = {
+            "xba": float(wx),
+            "contact": float(wc),
+            "p_hit_on_contact": float(wphc),
+            "hr_per_contact": float(whrpc),
+            "throws": throws,
+        }
+    return matchups
+
+
+def _weighted_reliever_pa(
+    reliever_matchups: dict[int, dict[str, float]],
+    usage_probs: dict[int, float],
+) -> tuple[float, float, float]:
+    """Given the per-reliever matchup scalars and per-PA usage
+    probabilities, return (blended_p_hit, blended_hr_per_contact,
+    blended_contact). Probabilities that reference a reliever we don't
+    have matchup data for are dropped and the remainder renormalized."""
+    present = {pid: w for pid, w in usage_probs.items() if pid in reliever_matchups}
+    total = sum(present.values())
+    if total <= 0:
+        # No overlap — caller should have already bailed, but be safe
+        return 0.0, 0.0, 0.0
+    norm = {pid: w / total for pid, w in present.items()}
+
+    blended_p_hit = 0.0
+    blended_hr_per_contact = 0.0
+    blended_contact = 0.0
+    for pid, prob in norm.items():
+        m = reliever_matchups[pid]
+        blended_p_hit += prob * m["p_hit_on_contact"]
+        blended_hr_per_contact += prob * m["hr_per_contact"]
+        blended_contact += prob * m["contact"]
+    return blended_p_hit, blended_hr_per_contact, blended_contact
+
+
+def _estimate_bullpen_inning(starter_avg_ip: float, pa_idx: int) -> int:
+    """Crude inning estimator for the `pa_index`-th bullpen PA by this
+    batter. Lineup cycles every ~3 innings so each extra bullpen PA for
+    the same batter is two innings later than the last. Clamped to
+    [7, 11] so weird starter workloads (openers, spot starts) don't
+    produce 4th-inning "bullpen" PAs or 15th-inning extras."""
+    base_inning = int(max(7, round(starter_avg_ip + 1.0)))
+    inning = base_inning + 2 * pa_idx
+    return int(max(7, min(11, inning)))
+
+
+def _bullpen_xba_proxy(reliever_matchups: dict[int, dict[str, float]]) -> float:
+    """Representative aggregate xBA for the MatchupV2.bullpen_xba
+    diagnostic field. Simple mean across the precomputed relievers;
+    usage weighting doesn't belong here since this is for display."""
+    if not reliever_matchups:
+        return LEAGUE_AVG_XBA
+    return float(sum(m["xba"] for m in reliever_matchups.values()) / len(reliever_matchups))
+
+
+def _append_team_level_bullpen_pa(
+    pa_probs: list["PAProbability"],
+    bullpen_profile: dict,
+    batter_df: pd.DataFrame,
+    batter_stands: str,
+    ump_xba_adj: float,
+    park_mult_hits: float,
+    park_mult_hr: float,
+    p_hr_raw: float,
+    data_quality: str,
+) -> None:
+    """Emit a single team-level bullpen PAProbability — used as the
+    per-PA fallback when the usage-probability predictor returns an
+    empty set for that slot (every arm back-to-back, etc.)."""
+    if batter_stands == "S":
+        bullpen_xba_base = (
+            bullpen_profile.get("xba_vs_l", LEAGUE_AVG_XBA)
+            + bullpen_profile.get("xba_vs_r", LEAGUE_AVG_XBA)
+        ) / 2
+    else:
+        key = "xba_vs_l" if batter_stands == "L" else "xba_vs_r"
+        bullpen_xba_base = bullpen_profile.get(key, LEAGUE_AVG_XBA)
+
+    if batter_df.empty:
+        contact_rate = LEAGUE_AVG_CONTACT_RATE
+    else:
+        pa_ending = batter_df[batter_df["events"].notna() & (batter_df["events"] != "")]
+        if pa_ending.empty:
+            contact_rate = LEAGUE_AVG_CONTACT_RATE
+        else:
+            strikeouts = pa_ending["events"].isin({"strikeout", "strikeout_double_play"}).sum()
+            walks = pa_ending["events"].isin({"walk", "hit_by_pitch", "intent_walk"}).sum()
+            n_pa = len(pa_ending)
+            n_contact = n_pa - strikeouts - walks
+            denom = n_pa - walks
+            raw = n_contact / denom if denom > 0 else LEAGUE_AVG_CONTACT_RATE
+            contact_rate = _regress(raw, n_pa, LEAGUE_AVG_CONTACT_RATE)
+
+    contact = float(np.clip(contact_rate, 0.40, 0.95))
+    xba = (bullpen_xba_base + ump_xba_adj) * park_mult_hits
+    p_hit = float(np.clip(contact * xba, 0.0, 0.42))
+    p_hr = float(np.clip(p_hr_raw * park_mult_hr, 0.0, 0.08))
+    p_1b, p_2b, p_3b = _split_xba_into_components(p_hit, p_hr)
+    pa_probs.append(PAProbability(
+        p_1b=p_1b, p_2b=p_2b, p_3b=p_3b, p_hr=p_hr,
+        source="bullpen",
+        data_quality=data_quality,
+    ))
 
 
 # ---------------------------------------------------------------------------
@@ -612,6 +753,15 @@ def build_matchup_v2(
                                        # now modeled via _pitcher_hr_per_contact_for_pitch.
                                        # Kept for API stability; unused.
     pitcher_df: pd.DataFrame | None = None,
+    # Fix F — optional per-reliever bullpen data. When all three are
+    # supplied (and the caller wants the per-reliever model active), the
+    # bullpen PAs are computed as a usage-probability-weighted log-5
+    # blend over individual relievers. Any of them empty/None silently
+    # falls back to the team-level `bullpen_profile`.
+    bullpen_roster: list[dict] | None = None,
+    reliever_arsenals: dict[int, dict] | None = None,
+    reliever_profiles: dict | None = None,
+    use_per_reliever_bullpen: bool = False,
 ) -> MatchupV2:
     """
     Construct the per-PA probability sequence for one batter vs one starter+bullpen.
@@ -644,7 +794,7 @@ def build_matchup_v2(
         starter_hr_per_contact_base,
         starter_breakdown,
         overall_data_quality,
-    ) = _compute_starter_matchup(
+    ) = _compute_pitcher_matchup(
         batter_df, starter_throws, starter_arsenal, as_of,
         pitcher_df=pitcher_df, batter_stands=batter_stands,
     )
@@ -708,55 +858,115 @@ def build_matchup_v2(
             data_quality=overall_data_quality,
         ))
 
-    # Bullpen PAs
-    # Use bullpen's actual xBA vs this batter's handedness (from Statcast data)
-    if batter_stands == "S":
-        # Switch hitters bat opposite-handed vs the pitcher, so average both sides
-        bullpen_xba_base = (
-            bullpen_profile.get("xba_vs_l", LEAGUE_AVG_XBA)
-            + bullpen_profile.get("xba_vs_r", LEAGUE_AVG_XBA)
-        ) / 2
-    else:
-        bullpen_xba_key = "xba_vs_l" if batter_stands == "L" else "xba_vs_r"
-        bullpen_xba_base = bullpen_profile.get(bullpen_xba_key, LEAGUE_AVG_XBA)
-
-    bullpen_xba_used = bullpen_xba_base
-
-    # Compute batter's overall contact rate (not vs-starter-specific) for bullpen PAs
-    if batter_df.empty:
-        bullpen_contact = LEAGUE_AVG_CONTACT_RATE
-    else:
-        pa_ending = batter_df[batter_df["events"].notna() & (batter_df["events"] != "")]
-        if pa_ending.empty:
-            bullpen_contact = LEAGUE_AVG_CONTACT_RATE
-        else:
-            strikeouts = pa_ending["events"].isin({"strikeout", "strikeout_double_play"}).sum()
-            walks = pa_ending["events"].isin({"walk", "hit_by_pitch", "intent_walk"}).sum()
-            n_pa = len(pa_ending)
-            n_contact = n_pa - strikeouts - walks
-            denom = n_pa - walks
-            raw = n_contact / denom if denom > 0 else LEAGUE_AVG_CONTACT_RATE
-            bullpen_contact = _regress(raw, n_pa, LEAGUE_AVG_CONTACT_RATE)
+    # Bullpen PAs. Two code paths:
+    #   (a) per-reliever (Fix F): usage-probability-weighted log-5 blend
+    #       over individual relievers, computed per bullpen PA slot.
+    #   (b) team-level fallback: single team-aggregate xBA × contact.
+    #
+    # We auto-fall back to (b) when per-reliever data isn't supplied,
+    # even if the flag is on — the data layer for rosters is best-effort
+    # and legitimately returns [] on network failures.
+    per_reliever_ok = (
+        use_per_reliever_bullpen
+        and bullpen_roster
+        and reliever_arsenals is not None
+        and reliever_profiles is not None
+    )
 
     n_bullpen_pa_int = int(np.ceil(exp_bullpen_pa))
-    for _ in range(n_bullpen_pa_int):
-        contact = float(np.clip(bullpen_contact, 0.40, 0.95))
-        xba = (bullpen_xba_base + ump_xba_adj) * park_mult_hits
 
-        # Bullpen xBA here is a team-level aggregate (already a composite rate,
-        # not pitch-type decomposed), so the E[X]·E[Y] ≠ E[X·Y] correction
-        # doesn't apply — contact × xba is fine here. Fix pending for when
-        # bullpen data gets pitch-type splits.
-        p_hit = contact * xba
-        p_hit = float(np.clip(p_hit, 0.0, 0.42))
+    if per_reliever_ok:
+        # One set of per-reliever matchup metrics — the inputs don't
+        # change across bullpen PA slots (it's the same batter vs the
+        # same set of relievers), so we pay the log-5 cost once per
+        # reliever, then weight by per-PA usage probs.
+        reliever_matchups = _precompute_reliever_matchups(
+            batter_df=batter_df,
+            bullpen_roster=bullpen_roster,
+            reliever_arsenals=reliever_arsenals or {},
+            reliever_profiles=reliever_profiles or {},
+            batter_stands=batter_stands,
+            as_of=as_of,
+        )
 
-        p_hr = float(np.clip(p_hr_raw * park_mult_hr, 0.0, 0.08))
-        p_1b, p_2b, p_3b = _split_xba_into_components(p_hit, p_hr)
-        pa_probs.append(PAProbability(
-            p_1b=p_1b, p_2b=p_2b, p_3b=p_3b, p_hr=p_hr,
-            source="bullpen",
-            data_quality=overall_data_quality,
-        ))
+        bullpen_xba_used = _bullpen_xba_proxy(reliever_matchups)
+
+        for pa_idx in range(n_bullpen_pa_int):
+            expected_inning = _estimate_bullpen_inning(avg_ip, pa_idx)
+            usage_probs = predict_reliever_usage_probs(
+                bullpen_roster,
+                pa_index_in_game=pa_idx,
+                expected_inning=expected_inning,
+                batter_stands=batter_stands,
+                top_n=6,
+            )
+            if not usage_probs:
+                # Usage predictor bailed (all arms ineligible today, etc.) —
+                # fall back to a single PA using the team-level numbers.
+                _append_team_level_bullpen_pa(
+                    pa_probs, bullpen_profile, batter_df,
+                    batter_stands, ump_xba_adj, park_mult_hits,
+                    park_mult_hr, p_hr_raw, overall_data_quality,
+                )
+                continue
+
+            blended_p_hit, blended_hr_per_contact, blended_contact = \
+                _weighted_reliever_pa(reliever_matchups, usage_probs)
+
+            # Apply xBA-space ump adjustment converted to p_hit-space
+            # (same trick used on the starter side) and park multiplier.
+            p_hit = (blended_p_hit + ump_xba_adj * blended_contact) * park_mult_hits
+            p_hit = float(np.clip(p_hit, 0.0, 0.42))
+            p_hr = float(np.clip(
+                blended_hr_per_contact * blended_contact * park_mult_hr,
+                0.0, 0.08,
+            ))
+            p_1b, p_2b, p_3b = _split_xba_into_components(p_hit, p_hr)
+            pa_probs.append(PAProbability(
+                p_1b=p_1b, p_2b=p_2b, p_3b=p_3b, p_hr=p_hr,
+                source="bullpen",
+                data_quality=overall_data_quality,
+            ))
+    else:
+        # Team-level fallback — the pre-Fix-F behavior.
+        if batter_stands == "S":
+            bullpen_xba_base = (
+                bullpen_profile.get("xba_vs_l", LEAGUE_AVG_XBA)
+                + bullpen_profile.get("xba_vs_r", LEAGUE_AVG_XBA)
+            ) / 2
+        else:
+            bullpen_xba_key = "xba_vs_l" if batter_stands == "L" else "xba_vs_r"
+            bullpen_xba_base = bullpen_profile.get(bullpen_xba_key, LEAGUE_AVG_XBA)
+        bullpen_xba_used = bullpen_xba_base
+
+        if batter_df.empty:
+            bullpen_contact = LEAGUE_AVG_CONTACT_RATE
+        else:
+            pa_ending = batter_df[batter_df["events"].notna() & (batter_df["events"] != "")]
+            if pa_ending.empty:
+                bullpen_contact = LEAGUE_AVG_CONTACT_RATE
+            else:
+                strikeouts = pa_ending["events"].isin({"strikeout", "strikeout_double_play"}).sum()
+                walks = pa_ending["events"].isin({"walk", "hit_by_pitch", "intent_walk"}).sum()
+                n_pa = len(pa_ending)
+                n_contact = n_pa - strikeouts - walks
+                denom = n_pa - walks
+                raw = n_contact / denom if denom > 0 else LEAGUE_AVG_CONTACT_RATE
+                bullpen_contact = _regress(raw, n_pa, LEAGUE_AVG_CONTACT_RATE)
+
+        for _ in range(n_bullpen_pa_int):
+            contact = float(np.clip(bullpen_contact, 0.40, 0.95))
+            xba = (bullpen_xba_base + ump_xba_adj) * park_mult_hits
+            # Team-aggregate xba already composite → contact × xba is fine
+            p_hit = contact * xba
+            p_hit = float(np.clip(p_hit, 0.0, 0.42))
+            p_hr = float(np.clip(p_hr_raw * park_mult_hr, 0.0, 0.08))
+            p_1b, p_2b, p_3b = _split_xba_into_components(p_hit, p_hr)
+            pa_probs.append(PAProbability(
+                p_1b=p_1b, p_2b=p_2b, p_3b=p_3b, p_hr=p_hr,
+                source="bullpen",
+                data_quality=overall_data_quality,
+            ))
 
     return MatchupV2(
         batter_id=batter_id,

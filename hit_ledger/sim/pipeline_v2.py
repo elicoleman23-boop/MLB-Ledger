@@ -30,12 +30,14 @@ from hit_ledger.config import (
     PARK_FACTORS_HITS,
     PARK_FACTORS_HR,
     PBP_DEFAULT_N_SIMS,
+    USE_PER_RELIEVER_BULLPEN,
     USE_PITCH_BY_PITCH_SIM,
 )
 from hit_ledger.data import cache, lineups, statcast
 from hit_ledger.data import bullpen as bullpen_data
 from hit_ledger.data import pitcher_profile as pitcher_profile_data
 from hit_ledger.data import pitcher_workload
+from hit_ledger.data import relievers as relievers_data
 from hit_ledger.data import umpires as umpire_data
 from hit_ledger.data import bvp as bvp_data
 from hit_ledger.sim.engine_v2 import results_to_df_v2, simulate_v2
@@ -86,6 +88,7 @@ def run_daily_pipeline_v2(
     enable_bvp: bool = BVP_DEFAULT_ENABLED,
     use_pbp: bool = USE_PITCH_BY_PITCH_SIM,
     n_sims: int | None = None,
+    use_per_reliever_bullpen: bool = USE_PER_RELIEVER_BULLPEN,
 ) -> PipelineResultV2:
     """Full v2 pipeline.
 
@@ -176,6 +179,55 @@ def run_daily_pipeline_v2(
         progress_callback=lambda d, t: _tick(progress, "umpires", d / max(t, 1)),
     )
 
+    # 8b. Fix F — per-team bullpen rosters + top-N reliever profiles.
+    # Only fetched when the per-reliever bullpen model is on; otherwise
+    # we save a lot of network round-trips. Failures here downgrade the
+    # pipeline back to the team-level bullpen path (matchup_v2 checks
+    # for roster non-emptiness and falls back automatically).
+    team_rosters: dict[str, list[dict]] = {}
+    reliever_arsenals_all: dict[int, dict] = {}
+    reliever_profiles_all: dict[int, pd.DataFrame] = {}
+    if use_per_reliever_bullpen:
+        _tick(progress, "relievers", 0.0)
+        team_rosters = relievers_data.fetch_all_team_rosters(
+            list(set(lineups_df["team"].dropna().tolist())),
+            game_date,
+            progress_callback=lambda d, t: _tick(progress, "relievers", 0.5 * d / max(t, 1)),
+        )
+
+        # Filter each roster to its likely top-6 for the first bullpen PA,
+        # so we don't fetch expensive Statcast frames for mop-up arms.
+        candidate_ids: set[int] = set()
+        for team, roster in team_rosters.items():
+            if not roster:
+                continue
+            # Pick a representative batter handedness (R is most common);
+            # the top-6 is usage-driven, the platoon bonus is small here
+            # so handedness doesn't dramatically change the shortlist.
+            usage = relievers_data.predict_reliever_usage_probs(
+                roster,
+                pa_index_in_game=0,
+                expected_inning=8,
+                batter_stands="R",
+                top_n=6,
+            )
+            candidate_ids.update(int(pid) for pid in usage.keys())
+
+        n_cands = max(len(candidate_ids), 1)
+        for i, pid in enumerate(sorted(candidate_ids), start=1):
+            # Arsenal + pitcher-level Statcast frame for each candidate.
+            try:
+                throws, arsenal = statcast.fetch_pitcher_arsenal(pid, game_date)
+                reliever_arsenals_all[pid] = arsenal
+                reliever_profiles_all[pid] = pitcher_profile_data.fetch_pitcher_profile(
+                    pid, game_date,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "reliever_prefetch_failed pitcher_id=%s error=%r", pid, exc,
+                )
+            _tick(progress, "relievers", 0.5 + 0.5 * i / n_cands)
+
     # 9. Build v2 matchups
     _tick(progress, "matchups", 0.0)
     game_lookup = games_df.set_index("game_pk").to_dict("index")
@@ -224,6 +276,10 @@ def run_daily_pipeline_v2(
         pitcher_hr9 = (pitcher_stats_cache.get(opp_pitcher_id) or {}).get("hr_per_9")
         pitcher_df = pitcher_profiles.get(opp_pitcher_id, pd.DataFrame())
 
+        # Per-reliever bullpen inputs — lookups cost nothing when flag is off
+        # since team_rosters / reliever_* dicts are empty in that case.
+        opp_roster = team_rosters.get(opp_team) or []
+
         matchup = build_matchup_v2(
             batter_id=bid,
             batter_df=batter_df,
@@ -241,6 +297,10 @@ def run_daily_pipeline_v2(
             as_of=game_date,
             pitcher_hr9=pitcher_hr9,
             pitcher_df=pitcher_df,
+            bullpen_roster=opp_roster,
+            reliever_arsenals=reliever_arsenals_all,
+            reliever_profiles=reliever_profiles_all,
+            use_per_reliever_bullpen=use_per_reliever_bullpen,
         )
         matchups.append(matchup)
         batter_to_game[bid] = game_pk
@@ -277,14 +337,33 @@ def run_daily_pipeline_v2(
             arsenal = arsenal_info[1] if arsenal_info else {}
             pitcher_pitch_profiles[pid] = build_pitcher_pitch_profile(df, arsenal)
 
-        # Stopgap bullpen profile per team: no per-reliever data yet, so
-        # every team's bullpen gets the same league-prior profile.
-        # (Fix F replaces this with per-reliever profiles + usage weighting.)
+        # Team bullpen profile — when Fix F per-reliever data is present
+        # we usage-weight the pool (closer gets more replication in the
+        # aggregated frame than mop-up arms); otherwise fall back to the
+        # equal-weight pool from Fix E Phase 3 (which with empty inputs
+        # is a league-prior profile).
         team_names = set(batter_to_opp_team.values())
-        team_bullpen_profiles = {
-            team: build_team_bullpen_pitch_profile([], {}, {})
-            for team in team_names
-        }
+        team_bullpen_profiles: dict[str, dict] = {}
+        for team in team_names:
+            roster = team_rosters.get(team, [])
+            reliever_ids = [int(r["player_id"]) for r in roster if r.get("player_id")]
+            if use_per_reliever_bullpen and reliever_ids:
+                usage = relievers_data.predict_reliever_usage_probs(
+                    roster,
+                    pa_index_in_game=0,
+                    expected_inning=8,
+                    batter_stands="R",
+                    top_n=6,
+                )
+                team_bullpen_profiles[team] = build_team_bullpen_pitch_profile(
+                    reliever_ids,
+                    reliever_profiles_all,
+                    {pid: ("R", reliever_arsenals_all.get(pid, {})) for pid in reliever_ids},
+                    usage_probs=usage,
+                )
+            else:
+                team_bullpen_profiles[team] = build_team_bullpen_pitch_profile([], {}, {})
+
         batter_bullpen_profiles = {
             bid: team_bullpen_profiles.get(team, {})
             for bid, team in batter_to_opp_team.items()
