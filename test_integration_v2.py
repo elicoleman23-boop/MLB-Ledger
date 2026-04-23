@@ -51,8 +51,51 @@ def synth_batter_df(n_pitches: int = 500) -> pd.DataFrame:
     })
 
 
+def synth_pitcher_df(n_pitches: int = 1500, stingy: bool = True) -> pd.DataFrame:
+    """Synthetic pitcher profile. `stingy=True` produces a tough pitcher
+    (below-league xBA and contact); False gives a neutral pitcher."""
+    rng = np.random.default_rng(11)
+    pitch_types = rng.choice(
+        ["FF", "SI", "SL", "CU", "CH", "FC"],
+        size=n_pitches,
+        p=[0.40, 0.15, 0.22, 0.08, 0.10, 0.05],
+    )
+    # Opposing batter handedness mix
+    stand = rng.choice(["L", "R"], size=n_pitches, p=[0.4, 0.6])
+    is_pa_end = rng.random(n_pitches) < 0.4
+
+    # Stingy pitcher: lower hit rate, more Ks
+    hit_p = 0.20 if stingy else 0.28
+    k_p = 0.30 if stingy else 0.22
+    roll = rng.random(n_pitches)
+    events = np.where(
+        is_pa_end,
+        np.where(roll < hit_p, "single",
+                 np.where(roll < hit_p + k_p, "strikeout", "field_out")),
+        "",
+    )
+    hr_mask = is_pa_end & (rng.random(n_pitches) < (0.025 if stingy else 0.04))
+    events = np.where(hr_mask, "home_run", events)
+    xba_base = 0.20 if stingy else 0.26
+    xba = np.where(is_pa_end, rng.beta(2, 5, size=n_pitches) * (xba_base / 0.286), np.nan)
+
+    return pd.DataFrame({
+        "game_date": pd.date_range("2024-04-01", periods=n_pitches, freq="2h"),
+        "pitch_type": pitch_types,
+        "p_throws": "R",
+        "stand": stand,
+        "events": events,
+        "description": "",
+        "estimated_ba_using_speedangle": xba,
+        "launch_speed": 90.0,
+        "launch_angle": 15.0,
+        "batter": rng.integers(100000, 999999, size=n_pitches),
+    })
+
+
 def main():
     batter_df = synth_batter_df()
+    pitcher_df = synth_pitcher_df(stingy=True)
 
     # Three test scenarios
     scenarios = [
@@ -137,6 +180,7 @@ def main():
             venue=scen["venue"],
             umpire_k_dev=scen["umpire_k_dev"],
             as_of=date(2025, 6, 15),
+            pitcher_df=pitcher_df,
         )
 
         print(f"Expected PA vs starter: {mp.expected_pa_vs_starter:.2f}")
@@ -159,6 +203,19 @@ def main():
                     f"Starter p_hit (pre-park): "
                     f"old={naive_p_hit:.4f}  new={w_composite:.4f}  Δ={delta:+.4f}"
                 )
+
+        # Per-pitch-type breakdown with log-5 blend (batter | pitcher | blended)
+        print("\nPitch-mix breakdown (batter | pitcher | blended vs league):")
+        for b in mp.starter_breakdown:
+            print(
+                f"  {b['pitch_type']:3s} share={b['share'] * 100:4.1f}%  "
+                f"batter xBA={b['batter_xba']:.3f} ct={b['batter_contact']:.3f} "
+                f"(n={b['sample_pitches']})  |  "
+                f"pitcher xBA={b['pitcher_xba']:.3f} ct={b['pitcher_contact']:.3f} "
+                f"(n={b['pitcher_sample_pitches']})  |  "
+                f"blended xBA={b['blended_xba']:.3f} ct={b['blended_contact']:.3f}  "
+                f"lgxBA={b['league_xba']:.3f}"
+            )
 
         print(f"\nPer-PA probabilities:")
         for i, pa in enumerate(mp.pa_probs, 1):

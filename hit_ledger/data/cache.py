@@ -60,6 +60,14 @@ CREATE TABLE IF NOT EXISTS batter_profiles (
     PRIMARY KEY (game_date, batter_id)
 );
 
+CREATE TABLE IF NOT EXISTS pitcher_profiles (
+    game_date   TEXT NOT NULL,
+    pitcher_id  INTEGER NOT NULL,
+    profile_blob BLOB NOT NULL,
+    fetched_at  TEXT NOT NULL,
+    PRIMARY KEY (game_date, pitcher_id)
+);
+
 CREATE TABLE IF NOT EXISTS pitcher_arsenals (
     game_date    TEXT NOT NULL,
     pitcher_id   INTEGER NOT NULL,
@@ -260,6 +268,37 @@ def load_batter_profile(game_date: date, batter_id: int) -> pd.DataFrame | None:
             "SELECT profile_blob FROM batter_profiles "
             "WHERE game_date = ? AND batter_id = ?",
             (game_date.isoformat(), batter_id),
+        ).fetchone()
+    if row is None:
+        return None
+    return pickle.loads(row["profile_blob"])
+
+
+# ---------------------------------------------------------------------------
+# Pitcher profiles (pickled Statcast DataFrames — per-pitch view from the
+# pitcher's POV, mirroring batter_profiles)
+# ---------------------------------------------------------------------------
+def save_pitcher_profile(
+    game_date: date, pitcher_id: int, profile_df: pd.DataFrame
+) -> None:
+    blob = pickle.dumps(profile_df)
+    with _connect() as conn:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO pitcher_profiles
+            (game_date, pitcher_id, profile_blob, fetched_at)
+            VALUES (?, ?, ?, datetime('now'))
+            """,
+            (game_date.isoformat(), pitcher_id, blob),
+        )
+
+
+def load_pitcher_profile(game_date: date, pitcher_id: int) -> pd.DataFrame | None:
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT profile_blob FROM pitcher_profiles "
+            "WHERE game_date = ? AND pitcher_id = ?",
+            (game_date.isoformat(), pitcher_id),
         ).fetchone()
     if row is None:
         return None

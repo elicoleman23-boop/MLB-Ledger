@@ -25,6 +25,7 @@ import pandas as pd
 from hit_ledger.config import BVP_DEFAULT_ENABLED, PA_BY_LINEUP_SLOT, DEFAULT_PA
 from hit_ledger.data import cache, lineups, statcast
 from hit_ledger.data import bullpen as bullpen_data
+from hit_ledger.data import pitcher_profile as pitcher_profile_data
 from hit_ledger.data import pitcher_workload
 from hit_ledger.data import umpires as umpire_data
 from hit_ledger.data import bvp as bvp_data
@@ -94,9 +95,24 @@ def run_daily_pipeline_v2(
             pitcher_ids.append(int(g["away_pitcher_id"]))
     pitcher_ids = list(set(pitcher_ids))
 
+    # "pitchers" stage covers both arsenal + pitch-level profile fetches.
+    # Split the stage progress 50/50 between the two so the bar still
+    # advances smoothly without needing a new UI stage weight.
+    def _tick_pitchers_arsenal(done, total):
+        _tick(progress, "pitchers", 0.5 * (done / max(total, 1)))
+
+    def _tick_pitchers_profile(done, total):
+        _tick(progress, "pitchers", 0.5 + 0.5 * (done / max(total, 1)))
+
     pitcher_data = statcast.fetch_all_pitchers(
         pitcher_ids, game_date,
-        progress_callback=lambda d, t: _tick(progress, "pitchers", d / max(t, 1)),
+        progress_callback=_tick_pitchers_arsenal,
+    )
+
+    # Pitcher pitch-level profiles (for log-5 blend in matchup_v2)
+    pitcher_profiles = pitcher_profile_data.fetch_all_pitcher_profiles(
+        pitcher_ids, game_date,
+        progress_callback=_tick_pitchers_profile,
     )
 
     # 5. Starter workload (NEW)
@@ -170,6 +186,7 @@ def run_daily_pipeline_v2(
         ump_k_dev = ump_info.get("k_pct_dev") if ump_info else None
 
         pitcher_hr9 = (pitcher_stats_cache.get(opp_pitcher_id) or {}).get("hr_per_9")
+        pitcher_df = pitcher_profiles.get(opp_pitcher_id, pd.DataFrame())
 
         matchup = build_matchup_v2(
             batter_id=bid,
@@ -187,6 +204,7 @@ def run_daily_pipeline_v2(
             umpire_k_dev=ump_k_dev,
             as_of=game_date,
             pitcher_hr9=pitcher_hr9,
+            pitcher_df=pitcher_df,
         )
         matchups.append(matchup)
         batter_to_game[bid] = game_pk

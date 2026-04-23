@@ -190,6 +190,81 @@ def _batter_hr_rate(batter_df: pd.DataFrame) -> float:
     return _regress(raw, n_pa, LEAGUE_HR_PER_PA, k=REGRESSION_K_HR)
 
 
+def _pitcher_rates_for_pitch(
+    pitcher_df: pd.DataFrame,
+    pitch_type: str,
+    batter_stands: str,
+) -> tuple[float, float, int]:
+    """
+    Returns (pitcher_xba_on_contact, pitcher_contact_rate, n_pitches) for
+    this pitcher's specific pitch type vs batters of `batter_stands`.
+
+    Mirrors _xba_and_contact_for_split but computed from the pitcher's POV.
+    Filters pitcher_df on (pitch_type, stand == batter_stands).
+    """
+    league_xba = LEAGUE_XBA_BY_PITCH.get(pitch_type, LEAGUE_AVG_XBA)
+    league_whiff = LEAGUE_WHIFF_BY_PITCH.get(pitch_type, 0.25)
+    league_contact = max(0.50, 1.0 - league_whiff * 0.7)
+
+    if pitcher_df is None or pitcher_df.empty:
+        return league_xba, league_contact, 0
+
+    mask = pitcher_df["pitch_type"] == pitch_type
+    if batter_stands in ("L", "R") and "stand" in pitcher_df.columns:
+        mask &= pitcher_df["stand"] == batter_stands
+    pitches = pitcher_df[mask]
+    n = len(pitches)
+    if n == 0:
+        return league_xba, league_contact, 0
+
+    pa_ending = pitches[pitches["events"].notna() & (pitches["events"] != "")]
+    if pa_ending.empty:
+        return league_xba, league_contact, n
+
+    strikeout_events = {"strikeout", "strikeout_double_play"}
+    walk_events = {"walk", "hit_by_pitch", "intent_walk"}
+
+    n_pa = len(pa_ending)
+    n_strikeouts = int(pa_ending["events"].isin(strikeout_events).sum())
+    n_walks = int(pa_ending["events"].isin(walk_events).sum())
+    n_contact = n_pa - n_strikeouts - n_walks
+
+    contact_denom = n_pa - n_walks
+    contact_rate = n_contact / contact_denom if contact_denom > 0 else league_contact
+
+    ball_in_play = pa_ending[~pa_ending["events"].isin(strikeout_events | walk_events)]
+    if ball_in_play.empty:
+        xba_on_contact = league_xba
+    else:
+        xba_series = ball_in_play["estimated_ba_using_speedangle"].copy()
+        hit_events = {"single", "double", "triple", "home_run"}
+        for idx in xba_series[xba_series.isna()].index:
+            ev = ball_in_play.at[idx, "events"]
+            xba_series.at[idx] = 1.0 if ev in hit_events else 0.0
+        xba_on_contact = float(xba_series.mean())
+
+    return xba_on_contact, contact_rate, n
+
+
+def _log5_blend(p_batter: float, p_pitcher: float, p_league: float) -> float:
+    """
+    Bill James odds-ratio blend of a batter rate and pitcher rate against a
+    league baseline. Returns the combined matchup probability.
+
+        p_combined = (p_b · p_p / p_lg) /
+                     (p_b · p_p / p_lg + (1 - p_b)·(1 - p_p)/(1 - p_lg))
+
+    Clips all inputs to [0.001, 0.999] so the division and the 1 - p terms
+    don't blow up on pathological inputs.
+    """
+    p_league = max(0.001, min(0.999, p_league))
+    p_batter = max(0.001, min(0.999, p_batter))
+    p_pitcher = max(0.001, min(0.999, p_pitcher))
+    num = (p_batter * p_pitcher) / p_league
+    denom = num + ((1 - p_batter) * (1 - p_pitcher)) / (1 - p_league)
+    return num / denom
+
+
 def _batter_overall_contact_rate(batter_df: pd.DataFrame) -> tuple[float, int]:
     """Batter's overall contact rate across all pitches, with n_pa for sufficiency checks."""
     if batter_df.empty:
@@ -215,14 +290,17 @@ def _compute_starter_matchup(
     pitcher_throws: str,
     pitcher_arsenal: dict[str, float],
     as_of: date,
+    pitcher_df: pd.DataFrame | None = None,
+    batter_stands: str = "R",
 ) -> tuple[float, float, float, list[dict], str]:
     """
-    Compute weighted xBA on contact AND contact rate across pitch types.
+    Compute weighted xBA on contact AND contact rate across pitch types,
+    blending batter and pitcher per-pitch-type rates via log-5.
 
-    BATTER SPLITS ARE THE CORE EDGE:
-    - If pitcher throws 40% sliders and batter CRUSHES sliders → huge edge
-    - If pitcher throws 40% sliders and batter struggles vs sliders → bad matchup
-    - The edge is proportional to (batter_performance - league_avg) × pitch_usage
+    BATTER SPLITS ARE ONE SIDE OF THE EDGE:
+    - Batter's performance vs (pitch_type, p_throws) sets their half.
+    - Pitcher's performance vs (pitch_type, batter_stands) sets the other.
+    - Log-5 combines them against the league baseline for that pitch type.
 
     P(hit per PA) = P(contact) × P(hit | contact)
                   = contact_rate × xba_on_contact
@@ -233,6 +311,11 @@ def _compute_starter_matchup(
     composite p_hit, `weighted_p_hit_on_contact = Σ (share_i · contact_i · xba_i)`,
     is the mathematically correct per-PA hit probability and should be
     preferred over `weighted_contact × weighted_xba` downstream.
+
+    If `pitcher_df` is empty or the pitcher has too few samples for a pitch
+    type (< MIN_PITCHES_PER_SPLIT), the pitcher side falls back fully to the
+    league prior — which makes the log-5 blend degrade to the batter rate
+    alone (preserving pre-Fix-B behavior when pitcher data is unavailable).
 
     Returns (weighted_xba, weighted_contact, weighted_p_hit_on_contact,
              breakdown, overall_data_quality).
@@ -301,20 +384,42 @@ def _compute_starter_matchup(
             else:
                 data_quality = "limited"
 
-        weighted_xba += share * adjusted_xba
-        weighted_contact += share * adjusted_contact
+        # PITCHER SIDE — rates vs this pitch type and batter handedness.
+        # Regress toward the league prior; below MIN sample, fall back fully.
+        pitcher_xba_raw, pitcher_contact_raw, n_pitcher = _pitcher_rates_for_pitch(
+            pitcher_df, pitch_type, batter_stands
+        )
+        if n_pitcher < MIN_PITCHES_PER_SPLIT:
+            pitcher_adjusted_xba = xba_prior
+            pitcher_adjusted_contact = league_contact_for_pitch
+        else:
+            pitcher_adjusted_xba = _regress(
+                pitcher_xba_raw, n_pitcher, xba_prior, k=REGRESSION_K_XBA
+            )
+            pitcher_adjusted_contact = _regress(
+                pitcher_contact_raw, n_pitcher, league_contact_for_pitch, k=REGRESSION_K_CONTACT
+            )
+
+        # LOG-5 BLEND vs league baseline for this pitch type. When either
+        # side equals the league, log-5 collapses to the other side.
+        blended_xba = _log5_blend(adjusted_xba, pitcher_adjusted_xba, xba_prior)
+        blended_contact = _log5_blend(
+            adjusted_contact, pitcher_adjusted_contact, league_contact_for_pitch
+        )
+
+        weighted_xba += share * blended_xba
+        weighted_contact += share * blended_contact
         # Mathematically correct composite: weight per-pitch p_hit, don't
         # multiply two independently-weighted averages (they covary).
-        weighted_p_hit_on_contact += share * adjusted_contact * adjusted_xba
+        weighted_p_hit_on_contact += share * blended_contact * blended_xba
         total_share += share
 
-        # Calculate the ACTUAL hit probability for this pitch type
-        # This is where the batter's specific splits create real edge
-        pitch_hit_prob = adjusted_contact * adjusted_xba
+        # Pitch-level matchup hit probability uses the BLENDED rates.
+        pitch_hit_prob = blended_contact * blended_xba
         league_hit_prob = league_contact_for_pitch * xba_prior
 
-        # Edge = how much better/worse this batter is vs this pitch vs average
-        # If pitcher throws this pitch 40% and batter has +0.05 edge, that's +0.02 total
+        # Edge = full matchup vs league avg. Reflects batter strength AND
+        # pitcher weakness together.
         raw_edge = pitch_hit_prob - league_hit_prob
 
         breakdown.append({
@@ -322,6 +427,10 @@ def _compute_starter_matchup(
             "share": share,
             "batter_xba": adjusted_xba,
             "batter_contact": adjusted_contact,
+            "pitcher_xba": pitcher_adjusted_xba,
+            "pitcher_contact": pitcher_adjusted_contact,
+            "blended_xba": blended_xba,
+            "blended_contact": blended_contact,
             "hit_prob": pitch_hit_prob,
             "league_xba": xba_prior,
             "league_contact": league_contact_for_pitch,
@@ -329,6 +438,7 @@ def _compute_starter_matchup(
             "edge": raw_edge,
             "weighted_edge": raw_edge * share,  # Impact on total matchup
             "sample_pitches": n_season,
+            "pitcher_sample_pitches": n_pitcher,
             "data_quality": data_quality,
         })
 
@@ -394,6 +504,7 @@ def build_matchup_v2(
     umpire_k_dev: float | None = None,
     as_of: date | None = None,
     pitcher_hr9: float | None = None,
+    pitcher_df: pd.DataFrame | None = None,
 ) -> MatchupV2:
     """
     Construct the per-PA probability sequence for one batter vs one starter+bullpen.
@@ -422,7 +533,8 @@ def build_matchup_v2(
         starter_breakdown,
         overall_data_quality,
     ) = _compute_starter_matchup(
-        batter_df, starter_throws, starter_arsenal, as_of
+        batter_df, starter_throws, starter_arsenal, as_of,
+        pitcher_df=pitcher_df, batter_stands=batter_stands,
     )
 
     # Step 2: expected PAs vs starter
